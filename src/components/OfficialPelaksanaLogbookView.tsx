@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   OfficialLogbookItem,
   OfficialNurseLogbookMonth,
@@ -11,6 +11,7 @@ import {
   computeDailyActivitiesCount,
   computeItemTotalAndPct
 } from '../data/officialPelaksanaLogbookData.ts';
+import { getWibDateParts } from '../utils/dateHelpers.ts';
 import { OfficialPelaksanaLogbookPrintable } from './OfficialPelaksanaLogbookPrintable.tsx';
 import { printDocumentWithOrientation, downloadElementAsPdf } from '../utils/printHelpers.ts';
 import {
@@ -57,8 +58,33 @@ interface OfficialPelaksanaLogbookViewProps {
 export const OfficialPelaksanaLogbookView: React.FC<OfficialPelaksanaLogbookViewProps> = ({
   masterNurses = []
 }) => {
-  const [logbook, setLogbook] = useState<OfficialNurseLogbookMonth>(createInitialOfficialLogbook);
-  const [selectedDay, setSelectedDay] = useState<number>(20); // 1-31
+  const [logbook, setLogbook] = useState<OfficialNurseLogbookMonth>(() =>
+    createInitialOfficialLogbook({
+      nurseName: masterNurses[0]?.name,
+      nipNira: masterNurses[0]?.nip
+    })
+  );
+  const [selectedDay, setSelectedDay] = useState<number>(() => getWibDateParts().day); // 1-31
+
+  useEffect(() => {
+    const syncFromVerifiedService = () => {
+      setLogbook((prev) =>
+        createInitialOfficialLogbook({
+          nurseName: prev.nurseName && prev.nurseName !== '-' ? prev.nurseName : masterNurses[0]?.name,
+          nipNira: prev.nipNira && prev.nipNira !== '-' ? prev.nipNira : masterNurses[0]?.nip,
+          shift: prev.shift
+        })
+      );
+    };
+    window.addEventListener('logbook_records_updated', syncFromVerifiedService);
+    window.addEventListener('verification_registry_updated', syncFromVerifiedService);
+    window.addEventListener('storage', syncFromVerifiedService);
+    return () => {
+      window.removeEventListener('logbook_records_updated', syncFromVerifiedService);
+      window.removeEventListener('verification_registry_updated', syncFromVerifiedService);
+      window.removeEventListener('storage', syncFromVerifiedService);
+    };
+  }, [masterNurses]);
   const [activeTab, setActiveTab] = useState<'daily_input' | 'monthly_matrix' | 'print_preview'>('daily_input');
   const [filterBagian, setFilterBagian] = useState<number | 'all'>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -380,11 +406,13 @@ export const OfficialPelaksanaLogbookView: React.FC<OfficialPelaksanaLogbookView
                 value={logbook.nurseName}
                 onChange={e => {
                   const n = masterNurses.find(mn => mn.name === e.target.value);
-                  setLogbook(prev => ({
-                    ...prev,
-                    nurseName: e.target.value,
-                    nipNira: n?.nip ? `${n.nip} / NIRA 3404` : prev.nipNira
-                  }));
+                  setLogbook(prev =>
+                    createInitialOfficialLogbook({
+                      nurseName: e.target.value,
+                      nipNira: n?.nip ? `${n.nip} / NIRA 3404` : prev.nipNira,
+                      shift: prev.shift
+                    })
+                  );
                   showToast(`Perawat pelaksana diubah ke: ${e.target.value}`, 'info');
                 }}
                 className="w-full text-xs font-bold text-slate-800 bg-white border border-slate-300 rounded-xl px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:outline-hidden transition-all shadow-2xs"

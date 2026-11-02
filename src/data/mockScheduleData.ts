@@ -1,366 +1,619 @@
 import {
-  NurseScheduleEntry,
-  DoctorScheduleEntry,
-  MasterNurse,
-  MasterDoctor,
-  ShiftName
-} from '../types/dialysis.ts';
-import { getCurrentIsoDateWib } from '../utils/dateHelpers.ts';
-import { sampleBenchmarkNurses, initialMasterDoctors } from './mockMasterData.ts';
+  collection,
+  doc,
+  setDoc,
+  getDoc,
+  getDocs,
+  deleteDoc,
+  query,
+  where,
+  onSnapshot
+} from 'firebase/firestore';
 import {
-  generateMonthlyNurseRoster,
-  generateMonthlyDoctorRoster,
-  parseYearMonthFromIso
-} from '../utils/monthlyScheduleMatrixHelpers.ts';
+  db,
+  cleanFirestoreData,
+  handleFirestoreError,
+  OperationType,
+  isFirestoreQuotaExhausted
+} from '../services/firebase.ts';
+import type { NurseScheduleEntry, DoctorScheduleEntry } from '../types/dialysis.ts';
+import { sampleBenchmarkNurses, initialMasterDoctors } from './mockMasterData.ts';
+
+function sanitizeScheduleDocId(id: string): string {
+  const cleaned = (id || '').trim().replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 128);
+  return cleaned || `sch_${Date.now()}`;
+}
 
 /**
- * Generate standard benchmark nurse schedules for a specified ISO date (YYYY-MM-DD).
- * Standard RS Happy Land Hemodialysis Roster:
- * - 1 Kepala Ruang: TWIS FERTILIANTI PW (Pagi / Supervisi)
- * - Shift Pagi: PJ M HAIKAL MALILANG, 6 Pelaksana (RIZKY, DEA, BRILLI, SISWANTINI, RENI, HARI ENDAH)
- * - Shift Siang: PJ APRILLIA DWI N, 6 Pelaksana (AYU W, FRANSISCA RANI, NITA, RINI, YUMIATI, AYU PUSPITA)
- * - Off / Cadangan: M NOR KHOIRUDIN (PJ Off), NOVIALITA ARYADI (PJ Off)
+ * Menghasilkan jadwal perawat benchmark harian yang selaras dengan ID matriks bulanan
+ * (`nsch-${dateIso}-${nurse.id}`) apabila koleksi cloud belum pernah diinisialisasi.
  */
 export function generateBenchmarkNurseSchedules(dateIso: string): NurseScheduleEntry[] {
-  return [
-    // 1. Kepala Ruang
-    {
-      id: `nsch-${dateIso}-01`,
-      nurseId: 'nurse-hdhl-01',
-      nurseName: 'TWIS FERTILIANTI PW',
-      date: dateIso,
-      shift: 'Pagi',
-      isPjShift: false,
-      notes: 'Supervisi Klinis & Manajerial Unit HD'
-    },
-    // 2. PJ Shift Pagi
-    {
-      id: `nsch-${dateIso}-02`,
-      nurseId: 'nurse-hdhl-02',
-      nurseName: 'M HAIKAL MALILANG',
-      date: dateIso,
-      shift: 'Pagi',
-      isPjShift: true,
-      notes: 'PJ Shift Pagi (Penanggung Jawab Operasional)'
-    },
-    // 3. PJ Shift Siang Cadangan / Off
-    {
-      id: `nsch-${dateIso}-03`,
-      nurseId: 'nurse-hdhl-03',
-      nurseName: 'M NOR KHOIRUDIN',
-      date: dateIso,
-      shift: 'Libur',
-      isPjShift: false,
-      notes: 'Off Dinas Rutin'
-    },
-    // 4. PJ Shift Siang
-    {
-      id: `nsch-${dateIso}-04`,
-      nurseId: 'nurse-hdhl-04',
-      nurseName: 'APRILLIA DWI N',
-      date: dateIso,
-      shift: 'Siang',
-      isPjShift: true,
-      notes: 'PJ Shift Siang (Penanggung Jawab Operasional)'
-    },
-    // 5. PJ Shift Pagi Cadangan / Off
-    {
-      id: `nsch-${dateIso}-05`,
-      nurseId: 'nurse-hdhl-05',
-      nurseName: 'NOVIALITA ARYADI',
-      date: dateIso,
-      shift: 'Libur',
-      isPjShift: false,
-      notes: 'Off Dinas Rutin'
-    },
-    // 6-11. Pelaksana Shift Pagi (6 Perawat)
-    {
-      id: `nsch-${dateIso}-06`,
-      nurseId: 'nurse-hdhl-06',
-      nurseName: 'RIZKY WAHYU A',
-      date: dateIso,
-      shift: 'Pagi',
-      isPjShift: false,
-      notes: 'Bed A01 - A04 (Zonasi Reguler)'
-    },
-    {
-      id: `nsch-${dateIso}-07`,
-      nurseId: 'nurse-hdhl-07',
-      nurseName: 'DEA IKA P',
-      date: dateIso,
-      shift: 'Pagi',
-      isPjShift: false,
-      notes: 'Bed A05 - A08 (Zonasi Reguler)'
-    },
-    {
-      id: `nsch-${dateIso}-08`,
-      nurseId: 'nurse-hdhl-08',
-      nurseName: 'Y BRILLISANTO',
-      date: dateIso,
-      shift: 'Pagi',
-      isPjShift: false,
-      notes: 'Bed A09 - A12 (Zonasi Reguler)'
-    },
-    {
-      id: `nsch-${dateIso}-09`,
-      nurseId: 'nurse-hdhl-09',
-      nurseName: 'SISWANTINI CATUR P',
-      date: dateIso,
-      shift: 'Pagi',
-      isPjShift: false,
-      notes: 'Bed B01 - B04 (Zonasi Reguler)'
-    },
-    {
-      id: `nsch-${dateIso}-10`,
-      nurseId: 'nurse-hdhl-10',
-      nurseName: 'RENI DWI A',
-      date: dateIso,
-      shift: 'Pagi',
-      isPjShift: false,
-      notes: 'Bed B05 - B09 (Zonasi Reguler)'
-    },
-    {
-      id: `nsch-${dateIso}-11`,
-      nurseId: 'nurse-hdhl-11',
-      nurseName: 'HARI ENDAH C',
-      date: dateIso,
-      shift: 'Pagi',
-      isPjShift: false,
-      notes: 'Bed Isolasi Hep B & Hep C (ISO 01-04)'
-    },
-    // 12-17. Pelaksana Shift Siang (6 Perawat)
-    {
-      id: `nsch-${dateIso}-12`,
-      nurseId: 'nurse-hdhl-12',
-      nurseName: 'AYU WULANDARI',
-      date: dateIso,
-      shift: 'Siang',
-      isPjShift: false,
-      notes: 'Bed A01 - A04 (Zonasi Reguler)'
-    },
-    {
-      id: `nsch-${dateIso}-13`,
-      nurseId: 'nurse-hdhl-13',
-      nurseName: 'FRANSISCA RANI L',
-      date: dateIso,
-      shift: 'Siang',
-      isPjShift: false,
-      notes: 'Bed A05 - A08 (Zonasi Reguler)'
-    },
-    {
-      id: `nsch-${dateIso}-14`,
-      nurseId: 'nurse-hdhl-14',
-      nurseName: 'NITA RESTIANA P',
-      date: dateIso,
-      shift: 'Siang',
-      isPjShift: false,
-      notes: 'Bed A09 - A12 (Zonasi Reguler)'
-    },
-    {
-      id: `nsch-${dateIso}-15`,
-      nurseId: 'nurse-hdhl-15',
-      nurseName: 'RINI WULANDARI',
-      date: dateIso,
-      shift: 'Siang',
-      isPjShift: false,
-      notes: 'Bed B01 - B04 (Zonasi Reguler)'
-    },
-    {
-      id: `nsch-${dateIso}-16`,
-      nurseId: 'nurse-hdhl-16',
-      nurseName: 'YUMIATI',
-      date: dateIso,
-      shift: 'Siang',
-      isPjShift: false,
-      notes: 'Bed B05 - B09 (Zonasi Reguler)'
-    },
-    {
-      id: `nsch-${dateIso}-17`,
-      nurseId: 'nurse-hdhl-17',
-      nurseName: 'AYU PUSPITA',
-      date: dateIso,
-      shift: 'Siang',
-      isPjShift: false,
-      notes: 'Bed Isolasi Hep B & Hep C (ISO 01-04)'
+  const parsed = new Date(`${dateIso}T00:00:00`);
+  const isSunday = !Number.isNaN(parsed.getTime()) && parsed.getDay() === 0;
+  const dayOfMonth = !Number.isNaN(parsed.getTime()) ? parsed.getDate() : 1;
+
+  return sampleBenchmarkNurses.map((nurse, idx) => {
+    let shift: NurseScheduleEntry['shift'] = 'Pagi';
+    let isPjShift = false;
+
+    if (isSunday) {
+      shift = idx % 4 === 0 ? 'On-Call' : 'Libur';
+    } else if (nurse.role === 'kepala_ruangan') {
+      shift = 'Pagi';
+      isPjShift = false;
+    } else if (nurse.role === 'pj_shift') {
+      const pagiFirst = idx % 2 === 0;
+      shift = (dayOfMonth + (pagiFirst ? 0 : 1)) % 2 === 1 ? 'Pagi' : 'Siang';
+      isPjShift = true;
+    } else {
+      const cycle = (dayOfMonth + idx) % 6;
+      if (cycle === 5) {
+        shift = 'Libur';
+      } else if (cycle <= 2) {
+        shift = 'Pagi';
+      } else {
+        shift = 'Siang';
+      }
     }
-  ];
+
+    return {
+      id: sanitizeScheduleDocId(`nsch-${dateIso}-${nurse.id}`),
+      nurseId: nurse.id,
+      nurseName: nurse.name,
+      nip: nurse.nip,
+      role: nurse.role,
+      date: dateIso,
+      shift,
+      isPjShift,
+      notes: ''
+    };
+  });
 }
 
 /**
- * Generate standard benchmark doctor schedules for a specified ISO date (YYYY-MM-DD).
- * Standard RS Happy Land Hemodialysis Roster:
- * - 3 Dokter DPJP (Pagi: dr. Heru Prasanto; Siang: dr. Muntaqinah; On-Call: dr. Alfany Fajar)
- * - 10 Dokter Ruangan (Pagi: dr. Addiniya & dr. Agnes; Siang: dr. Clara & dr. I Gede; On-Call: dr. Krishna & dr. Paramitha; Off/Libur: dr. Raden Alif, dr. Reza Rizki, dr. Talitha, dr. Tika)
+ * Menghasilkan jadwal dokter benchmark harian yang selaras dengan ID matriks bulanan
+ * (`dsch-${dateIso}-${doc.id}`) apabila koleksi cloud belum pernah diinisialisasi.
  */
 export function generateBenchmarkDoctorSchedules(dateIso: string): DoctorScheduleEntry[] {
-  return [
-    // 3 Dokter DPJP
-    {
-      id: `dsch-${dateIso}-01`,
-      doctorId: 'doc-heru-prasanto',
-      doctorName: 'dr. RADEN HERU PRASANTO, Sp.PD-KGH',
-      date: dateIso,
-      shift: 'Pagi',
-      role: 'dpjp',
-      spesialisasi: 'Spesialis Penyakit Dalam - Konsultan Ginjal Hipertensi (Sp.PD-KGH)',
-      phone: '0812-3456-7890',
-      notes: 'DPJP Utama Shift Pagi (Visite & Preskripsi)'
-    },
-    {
-      id: `dsch-${dateIso}-02`,
-      doctorId: 'doc-muntaqinah',
-      doctorName: 'dr. MUNTAQINAH, MSC, Sp.PD',
-      date: dateIso,
-      shift: 'Siang',
-      role: 'dpjp',
-      spesialisasi: 'Spesialis Penyakit Dalam (Sp.PD, M.Sc)',
-      phone: '0812-3456-7891',
-      notes: 'DPJP Konsulen Shift Siang (Visite & Evaluasi HD)'
-    },
-    {
-      id: `dsch-${dateIso}-03`,
-      doctorId: 'doc-alfany-fajar',
-      doctorName: 'dr. ALFANY FAJAR ILMAWAN, Sp.PD',
-      date: dateIso,
-      shift: 'On-Call',
-      role: 'dpjp',
-      spesialisasi: 'Spesialis Penyakit Dalam (Sp.PD)',
-      phone: '0812-3456-7892',
-      notes: 'DPJP Konsulen On-Call / Komplikasi Khusus'
-    },
+  const parsed = new Date(`${dateIso}T00:00:00`);
+  const isSunday = !Number.isNaN(parsed.getTime()) && parsed.getDay() === 0;
+  const dayOfMonth = !Number.isNaN(parsed.getTime()) ? parsed.getDate() : 1;
 
-    // 10 Dokter Ruangan Hemodialisis
-    {
-      id: `dsch-${dateIso}-04`,
-      doctorId: 'doc-addiniya-burhan',
-      doctorName: 'dr. Addiniya Nurul Azmi Burhan',
-      date: dateIso,
-      shift: 'Pagi',
-      role: 'dokter_jaga',
-      spesialisasi: 'Dokter Ruangan Hemodialisis',
-      phone: '0813-1122-3301',
-      notes: 'Dokter Ruangan Standby Shift Pagi'
-    },
-    {
-      id: `dsch-${dateIso}-05`,
-      doctorId: 'doc-agnes-sandewa',
-      doctorName: 'dr. Agnes Treyssia Sandewa',
-      date: dateIso,
-      shift: 'Pagi',
-      role: 'dokter_jaga',
-      spesialisasi: 'Dokter Ruangan Hemodialisis',
-      phone: '0813-1122-3302',
-      notes: 'Dokter Ruangan Standby Shift Pagi'
-    },
-    {
-      id: `dsch-${dateIso}-06`,
-      doctorId: 'doc-clara-wahyudi',
-      doctorName: 'dr. Clara Silviana Wahyudi',
-      date: dateIso,
-      shift: 'Siang',
-      role: 'dokter_jaga',
-      spesialisasi: 'Dokter Ruangan Hemodialisis',
-      phone: '0813-1122-3303',
-      notes: 'Dokter Ruangan Standby Shift Siang'
-    },
-    {
-      id: `dsch-${dateIso}-07`,
-      doctorId: 'doc-gede-permana',
-      doctorName: 'dr. I Gede Surya Permana',
-      date: dateIso,
-      shift: 'Siang',
-      role: 'dokter_jaga',
-      spesialisasi: 'Dokter Ruangan Hemodialisis',
-      phone: '0813-1122-3304',
-      notes: 'Dokter Ruangan Standby Shift Siang'
-    },
-    {
-      id: `dsch-${dateIso}-08`,
-      doctorId: 'doc-krishna-arimurti',
-      doctorName: 'dr. Krishna Patria Arimurti',
-      date: dateIso,
-      shift: 'On-Call',
-      role: 'dokter_jaga',
-      spesialisasi: 'Dokter Ruangan Hemodialisis',
-      phone: '0813-1122-3305',
-      notes: 'Dokter Ruangan Cadangan / On-Call'
-    },
-    {
-      id: `dsch-${dateIso}-09`,
-      doctorId: 'doc-paramitha-kusumadewi',
-      doctorName: 'dr. Paramitha Kusumadewi',
-      date: dateIso,
-      shift: 'On-Call',
-      role: 'dokter_jaga',
-      spesialisasi: 'Dokter Ruangan Hemodialisis',
-      phone: '0813-1122-3306',
-      notes: 'Dokter Ruangan Cadangan / On-Call'
-    },
-    {
-      id: `dsch-${dateIso}-10`,
-      doctorId: 'doc-raden-alif',
-      doctorName: 'dr. Raden Alif Kuncorojati',
-      date: dateIso,
-      shift: 'Libur',
-      role: 'dokter_jaga',
-      spesialisasi: 'Dokter Ruangan Hemodialisis',
-      phone: '0813-1122-3307',
-      notes: 'Off Dinas Rutin'
-    },
-    {
-      id: `dsch-${dateIso}-11`,
-      doctorId: 'doc-reza-ramadhan',
-      doctorName: 'dr. Reza Rizki Ramadhan',
-      date: dateIso,
-      shift: 'Libur',
-      role: 'dokter_jaga',
-      spesialisasi: 'Dokter Ruangan Hemodialisis',
-      phone: '0813-1122-3308',
-      notes: 'Off Dinas Rutin'
-    },
-    {
-      id: `dsch-${dateIso}-12`,
-      doctorId: 'doc-talitha-islamey',
-      doctorName: 'dr. Talitha Ambar Islamey',
-      date: dateIso,
-      shift: 'Libur',
-      role: 'dokter_jaga',
-      spesialisasi: 'Dokter Ruangan Hemodialisis',
-      phone: '0813-1122-3309',
-      notes: 'Off Dinas Rutin'
-    },
-    {
-      id: `dsch-${dateIso}-13`,
-      doctorId: 'doc-tika-heryasari',
-      doctorName: 'dr. Tika Heryasari',
-      date: dateIso,
-      shift: 'Libur',
-      role: 'dokter_jaga',
-      spesialisasi: 'Dokter Ruangan Hemodialisis',
-      phone: '0813-1122-3310',
-      notes: 'Off Dinas Rutin'
+  return initialMasterDoctors.map((doctor, idx) => {
+    let shift: DoctorScheduleEntry['shift'] = 'Pagi';
+
+    if (doctor.role === 'dpjp' || doctor.role === 'both') {
+      shift = isSunday ? 'On-Call' : idx === 0 ? 'All-Day' : idx % 2 === 1 ? 'Pagi' : 'Siang';
+    } else {
+      if (isSunday) {
+        shift = idx % 3 === 0 ? 'On-Call' : 'Libur';
+      } else {
+        const mod = (dayOfMonth + idx) % 5;
+        shift = mod === 0 ? 'Pagi' : mod === 1 ? 'Siang' : 'Libur';
+      }
     }
-  ];
+
+    return {
+      id: sanitizeScheduleDocId(`dsch-${dateIso}-${doctor.id}`),
+      doctorId: doctor.id,
+      doctorName: doctor.name,
+      role: doctor.role === 'both' ? 'dpjp' : doctor.role,
+      spesialisasi: doctor.spesialisasi,
+      sip: doctor.sip,
+      phone: doctor.phone,
+      date: dateIso,
+      shift,
+      notes: ''
+    };
+  });
 }
 
-/**
- * Jadwal shift awal bawaan sistem dibuat bersih / kosong (empty array []).
- * Sistem tidak lagi mengisi jadwal tiruan otomatis yang berubah-ubah saat tanggal berganti.
- * Seluruh jadwal diinput riil oleh Perawat/Dokter/Admin atau diisi via fitur template bila diperlukan.
- */
 export const initialNurseSchedules: NurseScheduleEntry[] = [];
 export const initialDoctorSchedules: DoctorScheduleEntry[] = [];
 
-/**
- * Returns existing doctor schedules safely without forcing synthetic benchmarks.
- */
 export function ensureAllOfficialDoctorSchedules(
-  existingSchedules: DoctorScheduleEntry[],
-  _dateIso?: string
+  existing: DoctorScheduleEntry[],
+  dateIso?: string
 ): DoctorScheduleEntry[] {
-  if (!Array.isArray(existingSchedules)) {
-    return [];
+  if (Array.isArray(existing) && existing.length > 0) {
+    return existing;
   }
-  return existingSchedules;
+  if (!dateIso) return [];
+  return generateBenchmarkDoctorSchedules(dateIso);
 }
 
+// ============================================================================
+// STATUS INISIALISASI CLOUD AGAR JADWAL ADMIN TIDAK KEMBALI KE DEFAULT SAAT REFRESH
+// ============================================================================
+
+const SCHEDULE_META_DOC_ID = 'schedule_cloud_meta';
+const LOCAL_NURSE_INIT_KEY = 'cloud_nurse_schedule_initialized_v1';
+const LOCAL_DOCTOR_INIT_KEY = 'cloud_doctor_schedule_initialized_v1';
+
+let nurseCloudInitializedMem = false;
+let doctorCloudInitializedMem = false;
+
+function isCloudAvailable(): boolean {
+  return typeof window !== 'undefined' && !isFirestoreQuotaExhausted();
+}
+
+async function checkNurseCloudInitialized(): Promise<boolean> {
+  if (nurseCloudInitializedMem) return true;
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      if (window.localStorage.getItem(LOCAL_NURSE_INIT_KEY) === 'true') {
+        nurseCloudInitializedMem = true;
+        return true;
+      }
+      if (window.localStorage.getItem('dialysis_nurse_schedules_v3_clean') !== null) {
+        nurseCloudInitializedMem = true;
+        return true;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!isCloudAvailable()) return true;
+
+  try {
+    const metaSnap = await getDoc(doc(db, 'shift_reports', SCHEDULE_META_DOC_ID));
+    if (metaSnap.exists() && metaSnap.data()?.nurseInitialized === true) {
+      nurseCloudInitializedMem = true;
+      try {
+        window.localStorage.setItem(LOCAL_NURSE_INIT_KEY, 'true');
+      } catch {}
+      return true;
+    }
+
+    const legacySnap = await getDoc(doc(db, 'shift_reports', 'nurse_schedules_all'));
+    if (legacySnap.exists()) {
+      nurseCloudInitializedMem = true;
+      await markScheduleMetaInitialized({ nurseInitialized: true });
+      return true;
+    }
+
+    const anyDocsSnap = await getDocs(collection(db, 'nurse_schedules'));
+    if (!anyDocsSnap.empty) {
+      nurseCloudInitializedMem = true;
+      await markScheduleMetaInitialized({ nurseInitialized: true });
+      return true;
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, `shift_reports/${SCHEDULE_META_DOC_ID}`);
+  }
+  return false;
+}
+
+async function checkDoctorCloudInitialized(): Promise<boolean> {
+  if (doctorCloudInitializedMem) return true;
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      if (window.localStorage.getItem(LOCAL_DOCTOR_INIT_KEY) === 'true') {
+        doctorCloudInitializedMem = true;
+        return true;
+      }
+      if (window.localStorage.getItem('dialysis_doctor_schedules_v8_clean') !== null) {
+        doctorCloudInitializedMem = true;
+        return true;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!isCloudAvailable()) return true;
+
+  try {
+    const metaSnap = await getDoc(doc(db, 'shift_reports', SCHEDULE_META_DOC_ID));
+    if (metaSnap.exists() && metaSnap.data()?.doctorInitialized === true) {
+      doctorCloudInitializedMem = true;
+      try {
+        window.localStorage.setItem(LOCAL_DOCTOR_INIT_KEY, 'true');
+      } catch {}
+      return true;
+    }
+
+    const legacySnap = await getDoc(doc(db, 'shift_reports', 'doctor_schedules_all'));
+    if (legacySnap.exists()) {
+      doctorCloudInitializedMem = true;
+      await markScheduleMetaInitialized({ doctorInitialized: true });
+      return true;
+    }
+
+    const anyDocsSnap = await getDocs(collection(db, 'doctor_schedules'));
+    if (!anyDocsSnap.empty) {
+      doctorCloudInitializedMem = true;
+      await markScheduleMetaInitialized({ doctorInitialized: true });
+      return true;
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, `shift_reports/${SCHEDULE_META_DOC_ID}`);
+  }
+  return false;
+}
+
+async function markScheduleMetaInitialized(flags: {
+  nurseInitialized?: boolean;
+  doctorInitialized?: boolean;
+}): Promise<void> {
+  if (flags.nurseInitialized) {
+    nurseCloudInitializedMem = true;
+    try {
+      if (typeof window !== 'undefined') {
+        window.localStorage.setItem(LOCAL_NURSE_INIT_KEY, 'true');
+      }
+    } catch {}
+  }
+  if (flags.doctorInitialized) {
+    doctorCloudInitializedMem = true;
+    try {
+      if (typeof window !== 'undefined') {
+        window.localStorage.setItem(LOCAL_DOCTOR_INIT_KEY, 'true');
+      }
+    } catch {}
+  }
+
+  if (!isCloudAvailable()) return;
+
+  try {
+    await setDoc(
+      doc(db, 'shift_reports', SCHEDULE_META_DOC_ID),
+      cleanFirestoreData({
+        ...flags,
+        updatedAt: new Date().toISOString()
+      }),
+      { merge: true }
+    );
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, `shift_reports/${SCHEDULE_META_DOC_ID}`);
+  }
+}
+
+export const scheduleService = {
+  // 1. Ambil Jadwal Perawat Harian berdasarkan Tanggal Aktif dari Cloud Firestore
+  getNurseSchedules: async (dateIso: string): Promise<NurseScheduleEntry[]> => {
+    if (!isCloudAvailable()) {
+      return [];
+    }
+
+    try {
+      const q = query(collection(db, 'nurse_schedules'), where('date', '==', dateIso));
+      const querySnapshot = await getDocs(q);
+      const records: NurseScheduleEntry[] = [];
+
+      querySnapshot.forEach((docSnap) => {
+        records.push({
+          ...(docSnap.data() as NurseScheduleEntry),
+          id: docSnap.id
+        });
+      });
+
+      if (records.length === 0) {
+        const alreadyInitialized = await checkNurseCloudInitialized();
+        if (!alreadyInitialized) {
+          const benchmark = generateBenchmarkNurseSchedules(dateIso);
+          for (const entry of benchmark) {
+            const cleanId = sanitizeScheduleDocId(entry.id);
+            await setDoc(
+              doc(db, 'nurse_schedules', cleanId),
+              cleanFirestoreData({ ...entry, id: cleanId, updatedAt: new Date().toISOString() })
+            );
+          }
+          await markScheduleMetaInitialized({ nurseInitialized: true });
+          return benchmark;
+        }
+      } else {
+        nurseCloudInitializedMem = true;
+      }
+
+      return records;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, 'nurse_schedules');
+      return [];
+    }
+  },
+
+  // 1b. Ambil Seluruh Jadwal Perawat untuk Matriks Bulanan dari Cloud Firestore
+  getAllNurseSchedules: async (): Promise<NurseScheduleEntry[]> => {
+    if (!isCloudAvailable()) return [];
+    try {
+      const querySnapshot = await getDocs(collection(db, 'nurse_schedules'));
+      const records: NurseScheduleEntry[] = [];
+      querySnapshot.forEach((docSnap) => {
+        records.push({
+          ...(docSnap.data() as NurseScheduleEntry),
+          id: docSnap.id
+        });
+      });
+      if (records.length > 0) {
+        nurseCloudInitializedMem = true;
+      }
+      return records;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, 'nurse_schedules');
+      return [];
+    }
+  },
+
+  // 2. Simpan Modifikasi Jadwal Perawat oleh Administrator ke Cloud Firestore
+  saveNurseSchedule: async (entry: NurseScheduleEntry): Promise<void> => {
+    if (!isCloudAvailable()) return;
+    const cleanId = sanitizeScheduleDocId(entry.id);
+    const docPath = `nurse_schedules/${cleanId}`;
+    try {
+      await setDoc(
+        doc(db, 'nurse_schedules', cleanId),
+        cleanFirestoreData({
+          ...entry,
+          id: cleanId,
+          updatedAt: new Date().toISOString()
+        }),
+        { merge: true }
+      );
+      await markScheduleMetaInitialized({ nurseInitialized: true });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, docPath);
+    }
+  },
+
+  // 2b. Hapus Sel Jadwal Perawat saat dikosongkan ('-') oleh Administrator
+  deleteNurseSchedule: async (id: string): Promise<void> => {
+    if (!isCloudAvailable()) return;
+    const cleanId = sanitizeScheduleDocId(id);
+    const docPath = `nurse_schedules/${cleanId}`;
+    try {
+      await deleteDoc(doc(db, 'nurse_schedules', cleanId));
+      await markScheduleMetaInitialized({ nurseInitialized: true });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, docPath);
+    }
+  },
+
+  // 2c. Simpan / Ganti Batch Jadwal Bulanan Perawat secara Aman ke Cloud Firestore
+  saveNurseSchedulesBatch: async (
+    newEntries: NurseScheduleEntry[],
+    deletedIds: string[] = []
+  ): Promise<void> => {
+    if (!isCloudAvailable()) return;
+    try {
+      await markScheduleMetaInitialized({ nurseInitialized: true });
+      const CHUNK_SIZE = 40;
+
+      for (let i = 0; i < deletedIds.length; i += CHUNK_SIZE) {
+        const slice = deletedIds.slice(i, i + CHUNK_SIZE);
+        await Promise.all(
+          slice.map((rawId) => {
+            const cleanId = sanitizeScheduleDocId(rawId);
+            return deleteDoc(doc(db, 'nurse_schedules', cleanId));
+          })
+        );
+      }
+
+      const nowIso = new Date().toISOString();
+      for (let i = 0; i < newEntries.length; i += CHUNK_SIZE) {
+        const slice = newEntries.slice(i, i + CHUNK_SIZE);
+        await Promise.all(
+          slice.map((entry) => {
+            const cleanId = sanitizeScheduleDocId(entry.id);
+            return setDoc(
+              doc(db, 'nurse_schedules', cleanId),
+              cleanFirestoreData({
+                ...entry,
+                id: cleanId,
+                updatedAt: nowIso
+              }),
+              { merge: true }
+            );
+          })
+        );
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'nurse_schedules');
+    }
+  },
+
+  // 3. Ambil Jadwal Dokter Harian berdasarkan Tanggal Aktif dari Cloud Firestore
+  getDoctorSchedules: async (dateIso: string): Promise<DoctorScheduleEntry[]> => {
+    if (!isCloudAvailable()) {
+      return generateBenchmarkDoctorSchedules(dateIso);
+    }
+
+    try {
+      const q = query(collection(db, 'doctor_schedules'), where('date', '==', dateIso));
+      const querySnapshot = await getDocs(q);
+      const records: DoctorScheduleEntry[] = [];
+
+      querySnapshot.forEach((docSnap) => {
+        records.push({
+          ...(docSnap.data() as DoctorScheduleEntry),
+          id: docSnap.id
+        });
+      });
+
+      if (records.length === 0) {
+        const alreadyInitialized = await checkDoctorCloudInitialized();
+        if (!alreadyInitialized) {
+          const benchmark = generateBenchmarkDoctorSchedules(dateIso);
+          for (const entry of benchmark) {
+            const cleanId = sanitizeScheduleDocId(entry.id);
+            await setDoc(
+              doc(db, 'doctor_schedules', cleanId),
+              cleanFirestoreData({ ...entry, id: cleanId, updatedAt: new Date().toISOString() })
+            );
+          }
+          await markScheduleMetaInitialized({ doctorInitialized: true });
+          return benchmark;
+        }
+      } else {
+        doctorCloudInitializedMem = true;
+      }
+
+      return records;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, 'doctor_schedules');
+      return [];
+    }
+  },
+
+  // 3b. Ambil Seluruh Jadwal Dokter untuk Matriks Bulanan dari Cloud Firestore
+  getAllDoctorSchedules: async (): Promise<DoctorScheduleEntry[]> => {
+    if (!isCloudAvailable()) return [];
+    try {
+      const querySnapshot = await getDocs(collection(db, 'doctor_schedules'));
+      const records: DoctorScheduleEntry[] = [];
+      querySnapshot.forEach((docSnap) => {
+        records.push({
+          ...(docSnap.data() as DoctorScheduleEntry),
+          id: docSnap.id
+        });
+      });
+      if (records.length > 0) {
+        doctorCloudInitializedMem = true;
+      }
+      return records;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, 'doctor_schedules');
+      return [];
+    }
+  },
+
+  // 4. Simpan Modifikasi Jadwal Dokter oleh Administrator ke Cloud Firestore
+  saveDoctorSchedule: async (entry: DoctorScheduleEntry): Promise<void> => {
+    if (!isCloudAvailable()) return;
+    const cleanId = sanitizeScheduleDocId(entry.id);
+    const docPath = `doctor_schedules/${cleanId}`;
+    try {
+      await setDoc(
+        doc(db, 'doctor_schedules', cleanId),
+        cleanFirestoreData({
+          ...entry,
+          id: cleanId,
+          updatedAt: new Date().toISOString()
+        }),
+        { merge: true }
+      );
+      await markScheduleMetaInitialized({ doctorInitialized: true });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, docPath);
+    }
+  },
+
+  // 4b. Hapus Sel Jadwal Dokter saat dikosongkan ('-') oleh Administrator
+  deleteDoctorSchedule: async (id: string): Promise<void> => {
+    if (!isCloudAvailable()) return;
+    const cleanId = sanitizeScheduleDocId(id);
+    const docPath = `doctor_schedules/${cleanId}`;
+    try {
+      await deleteDoc(doc(db, 'doctor_schedules', cleanId));
+      await markScheduleMetaInitialized({ doctorInitialized: true });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, docPath);
+    }
+  },
+
+  // 4c. Simpan / Ganti Batch Jadwal Bulanan Dokter secara Aman ke Cloud Firestore
+  saveDoctorSchedulesBatch: async (
+    newEntries: DoctorScheduleEntry[],
+    deletedIds: string[] = []
+  ): Promise<void> => {
+    if (!isCloudAvailable()) return;
+    try {
+      await markScheduleMetaInitialized({ doctorInitialized: true });
+      const CHUNK_SIZE = 40;
+
+      for (let i = 0; i < deletedIds.length; i += CHUNK_SIZE) {
+        const slice = deletedIds.slice(i, i + CHUNK_SIZE);
+        await Promise.all(
+          slice.map((rawId) => {
+            const cleanId = sanitizeScheduleDocId(rawId);
+            return deleteDoc(doc(db, 'doctor_schedules', cleanId));
+          })
+        );
+      }
+
+      const nowIso = new Date().toISOString();
+      for (let i = 0; i < newEntries.length; i += CHUNK_SIZE) {
+        const slice = newEntries.slice(i, i + CHUNK_SIZE);
+        await Promise.all(
+          slice.map((entry) => {
+            const cleanId = sanitizeScheduleDocId(entry.id);
+            return setDoc(
+              doc(db, 'doctor_schedules', cleanId),
+              cleanFirestoreData({
+                ...entry,
+                id: cleanId,
+                updatedAt: nowIso
+              }),
+              { merge: true }
+            );
+          })
+        );
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'doctor_schedules');
+    }
+  },
+
+  // 5. Real-time Subscription Lintas Perangkat untuk nurse_schedules & doctor_schedules
+  subscribeAllNurseSchedules: (
+    onUpdate: (entries: NurseScheduleEntry[], isInitialized: boolean) => void,
+    onError?: (err: unknown) => void
+  ): (() => void) => {
+    if (!isCloudAvailable()) return () => {};
+    return onSnapshot(
+      collection(db, 'nurse_schedules'),
+      (snapshot) => {
+        if (snapshot.metadata.hasPendingWrites) return;
+        const list: NurseScheduleEntry[] = [];
+        snapshot.forEach((docSnap) => {
+          list.push({
+            ...(docSnap.data() as NurseScheduleEntry),
+            id: docSnap.id
+          });
+        });
+        if (list.length > 0) {
+          nurseCloudInitializedMem = true;
+        }
+        onUpdate(list, nurseCloudInitializedMem || list.length > 0);
+      },
+      (err) => {
+        if (onError) onError(err);
+        try {
+          handleFirestoreError(err, OperationType.LIST, 'nurse_schedules');
+        } catch {}
+      }
+    );
+  },
+
+  subscribeAllDoctorSchedules: (
+    onUpdate: (entries: DoctorScheduleEntry[], isInitialized: boolean) => void,
+    onError?: (err: unknown) => void
+  ): (() => void) => {
+    if (!isCloudAvailable()) return () => {};
+    return onSnapshot(
+      collection(db, 'doctor_schedules'),
+      (snapshot) => {
+        if (snapshot.metadata.hasPendingWrites) return;
+        const list: DoctorScheduleEntry[] = [];
+        snapshot.forEach((docSnap) => {
+          list.push({
+            ...(docSnap.data() as DoctorScheduleEntry),
+            id: docSnap.id
+          });
+        });
+        if (list.length > 0) {
+          doctorCloudInitializedMem = true;
+        }
+        onUpdate(list, doctorCloudInitializedMem || list.length > 0);
+      },
+      (err) => {
+        if (onError) onError(err);
+        try {
+          handleFirestoreError(err, OperationType.LIST, 'doctor_schedules');
+        } catch {}
+      }
+    );
+  }
+};

@@ -31,6 +31,7 @@ import {
   PER_PATIENT_STATUS_STORAGE_KEY,
   LogbookVerificationRegistryEntry,
   buildPatientVerificationKey,
+  convertLogbookRecordToRegistryEntry,
   getNurseStorageKey,
   isMatchingNurse,
   isSameBed,
@@ -42,6 +43,7 @@ import {
   resolveScheduledDoctorsFromMatrix,
   resolveScheduledNursesFromMatrix
 } from './monthlyScheduleMatrixHelpers.ts';
+import { logbookService } from '../data/officialPelaksanaLogbookData.ts';
 import type { NurseLogbookCloudData } from '../services/firebase.ts';
 
 export const DEFAULT_KEPALA_RUANGAN_NAME = 'TWIS FERTILIANTI PW';
@@ -220,6 +222,54 @@ function isSessionVerifiedForShiftAndDate(
   return false;
 }
 
+function mergeRegistryWithLogbookServiceForDate(
+  registryEntries: LogbookVerificationRegistryEntry[],
+  targetDateIso: string
+): LogbookVerificationRegistryEntry[] {
+  const verifiedFromService = logbookService.getCachedVerifiedReports({ tanggal: targetDateIso });
+  const pendingPj = logbookService
+    .getCachedPendingVerifications('PJ Shift')
+    .filter((r) => r.tanggal === targetDateIso);
+  const pendingKaruDirect = logbookService
+    .getCachedPendingVerifications('Kepala Ruang')
+    .filter((r) => r.tanggal === targetDateIso && r.statusVerifikasi === 'submitted');
+
+  const serviceRecords = [...verifiedFromService, ...pendingPj, ...pendingKaruDirect];
+  if (serviceRecords.length === 0) {
+    return registryEntries;
+  }
+
+  const merged = [...registryEntries];
+  serviceRecords.forEach((rec) => {
+    const mapped = convertLogbookRecordToRegistryEntry(rec);
+    const existingIdx = merged.findIndex((e) => {
+      if (mapped.id && e.id === mapped.id) return true;
+      const eIso = resolveRegistryEntryIsoDate(e);
+      if (eIso && mapped.dateKey && eIso !== mapped.dateKey) return false;
+      if (normalizeShiftChoice(e.shift) !== normalizeShiftChoice(mapped.shift)) return false;
+      return isMatchingNurse(e.submittedNurseName, mapped.submittedNurseName);
+    });
+
+    if (existingIdx >= 0) {
+      const prev = merged[existingIdx];
+      merged[existingIdx] = {
+        ...prev,
+        ...mapped,
+        status:
+          mapped.status === 'terverifikasi' || prev.status === 'terverifikasi'
+            ? 'terverifikasi'
+            : mapped.status,
+        patients:
+          mapped.patients && mapped.patients.length > 0 ? mapped.patients : prev.patients
+      };
+    } else {
+      merged.push(mapped);
+    }
+  });
+
+  return merged;
+}
+
 /**
  * Detects the active logbook shift ('Pagi' | 'Siang') for a given date so
  * Laporan Harian automatically aligns with the shift chosen during logbook input.
@@ -240,9 +290,13 @@ export function detectActiveLogbookShiftForDate(params: {
   } = params;
 
   const targetDateIso = indonesianDateLabelToIso(activeDateLabel);
+  const combinedRegistryEntries = mergeRegistryWithLogbookServiceForDate(
+    registryEntries,
+    targetDateIso
+  );
 
   // 1. Check verified registry entries on this date (most recent first)
-  const dateRegistryEntries = registryEntries.filter((e) => {
+  const dateRegistryEntries = combinedRegistryEntries.filter((e) => {
     const eIso = resolveRegistryEntryIsoDate(e);
     return eIso === targetDateIso && (e.shift === 'Pagi' || e.shift === 'Siang');
   });
@@ -421,8 +475,18 @@ export function aggregateShiftVerifiedLogbooks(params: {
   const activeDay = extractActiveDayName(activeDateFormatted) as HdTreatmentDay;
   const shiftHours = formatShiftHoursForShift(activeShift);
 
+  // Ambil laporan resmi terverifikasi dari logbookService & gabungkan dengan registri
+  const verifiedServiceReports = logbookService.getCachedVerifiedReports({
+    tanggal: activeDateIso,
+    shift: activeShift
+  });
+  const combinedRegistryEntries = mergeRegistryWithLogbookServiceForDate(
+    registryEntries,
+    activeDateIso
+  );
+
   // Filter registry entries matching this exact date & shift
-  const matchingShiftRegistry = registryEntries.filter((entry) => {
+  const matchingShiftRegistry = combinedRegistryEntries.filter((entry) => {
     const entryIso = resolveRegistryEntryIsoDate(entry);
     if (entryIso !== activeDateIso) return false;
     return normalizeShiftChoice(entry.shift) === activeShift;
@@ -444,6 +508,15 @@ export function aggregateShiftVerifiedLogbooks(params: {
     if (sShift !== activeShift) return;
     if (isSessionVerifiedForShiftAndDate(s, activeDateIso, activeShift, verifiedShiftRegistry)) {
       candidateVerifiedSessions.push(s);
+    }
+  });
+
+  // 1b. Sertakan sessionsSnapshot dari logbookService.getVerifiedReports() jika tersedia
+  verifiedServiceReports.forEach((rec) => {
+    if (Array.isArray(rec.sessionsSnapshot)) {
+      rec.sessionsSnapshot.forEach((snapSess) => {
+        candidateVerifiedSessions.push(snapSess);
+      });
     }
   });
 
@@ -576,10 +649,18 @@ export function aggregateShiftVerifiedLogbooks(params: {
     registerNurse(s.nurseInCharge, regMatch?.submittedNurseRole, true);
   });
 
-  // Also ensure any verified registry entry with non-empty patients is registered even if patient merged
+  // Also ensure any verified registry entry or logbookService verified report is registered
   verifiedShiftRegistry.forEach((entry) => {
     if (entry.patients && entry.patients.length > 0) {
       registerNurse(entry.submittedNurseName, entry.submittedNurseRole, false);
+    }
+  });
+  verifiedServiceReports.forEach((rec) => {
+    if (
+      (rec.patients && rec.patients.length > 0) ||
+      (Array.isArray(rec.items) && rec.items.some((it) => it.verified))
+    ) {
+      registerNurse(rec.namaPerawat, rec.perawatRole, false);
     }
   });
 

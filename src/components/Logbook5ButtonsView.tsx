@@ -38,7 +38,14 @@ import {
   Printer,
   CheckCircle
 } from 'lucide-react';
-import { OFFICIAL_LOGBOOK_ITEMS } from '../data/officialPelaksanaLogbookData.ts';
+import { OFFICIAL_LOGBOOK_ITEMS, logbookService } from '../data/officialPelaksanaLogbookData.ts';
+import {
+  pasienLogbookService,
+  buildDeterministicPatientSessionId,
+  formatBedAndMachineLabel,
+  calculateDialysisTimes,
+  type LaporanPasienRow
+} from '../data/laporanPasienData.ts';
 import { PelaksanaLogbookPrintableModal } from './PelaksanaLogbookPrintableModal.tsx';
 import { ensureFullBagianData } from '../utils/logbookStandards.ts';
 import {
@@ -115,6 +122,7 @@ import {
   getActivePoin4_3Complications,
   isPoin4_3Complete,
   formatPoin4_3Note,
+  resolveSessionComplicationsFromPoin4_3,
   Poin6_3ClinicalData,
   isPoin6_3Complete,
   formatPoin6_3Note,
@@ -4394,6 +4402,163 @@ export const Logbook5ButtonsView: React.FC<Logbook5ButtonsViewProps> = ({
   };
 
 
+  const buildShiftPatientSessionPayloads = React.useCallback(
+    (
+      patientsList: ManagedPatient[],
+      submissionsMap: Record<string, PjVerificationSubmission>
+    ): LaporanPasienRow[] => {
+      const resolvedShiftLabel: 'Pagi' | 'Siang' = activeShift === 'Siang' ? 'Siang' : 'Pagi';
+
+      return patientsList
+        .filter((tp) => Boolean(tp.patientName?.trim() || tp.bedNumber?.trim()))
+        .map((tp, idx) => {
+          const eff = getEffectivePatientSubmission(tp, submissionsMap);
+          const effKaru = Boolean(
+            eff.verifiedByRole && eff.verifiedByRole.toLowerCase().includes('kepala')
+          );
+          const rowStatusVerif: LaporanPasienRow['statusVerifikasi'] =
+            eff.status === 'terverifikasi'
+              ? effKaru
+                ? 'verified_karu'
+                : 'verified_pj'
+              : eff.status === 'diajukan'
+              ? 'submitted'
+              : 'draft';
+
+          const clinRaw =
+            patientClinicalDetails[tp.id] || patientClinicalDetails[tp.bedNumber] || undefined;
+          const clin = clinRaw ? normalizePatientClinicalDetails(clinRaw) : undefined;
+          const durasiJam = parseClinicalNumber(clin?.poin3_5?.waktuDialisis || '') || 4.5;
+          const times = calculateDialysisTimes(resolvedShiftLabel, durasiJam, idx);
+          const bbKering = parseClinicalNumber(clin?.poin3_2?.bbKering || '') || 60;
+          const bbPreHd =
+            parseClinicalNumber(clin?.poin3_2?.bbPre || '') || Number((bbKering + 2.0).toFixed(1));
+          const bbPostHd = parseClinicalNumber(clin?.poin3_2?.bbPost || '') || bbKering;
+          const qb = parseClinicalNumber(clin?.poin3_5?.qb || '') || 220;
+          const qd = parseClinicalNumber(clin?.poin3_5?.qd || '') || 500;
+          const targetUf =
+            parseClinicalNumber(clin?.poin3_5?.targetUfg || clin?.poin3_2?.ufg || '') || 2000;
+          const capaianUf = parseClinicalNumber(clin?.poin6_3?.ufgTercapai || '') || targetUf;
+          const ktV = parseClinicalNumber(clin?.poin6_3?.ktV || '') || 1.35;
+          const tdPre = clin?.poin3_3?.tdPreHd?.trim()
+            ? clin.poin3_3.tdPreHd.trim()
+            : clin?.poin3_3?.tdSistolik && clin?.poin3_3?.tdDiastolik
+            ? `${clin.poin3_3.tdSistolik}/${clin.poin3_3.tdDiastolik}`
+            : '140/85';
+          const tdPost = clin?.poin6_3?.tdPostHd?.trim() ? clin.poin6_3.tdPostHd.trim() : '125/80';
+
+          const statusRawat: 'Rawat Jalan' | 'Rawat Inap' =
+            clin?.poin3_1?.status === 'RAWAT INAP' ? 'Rawat Inap' : 'Rawat Jalan';
+          const ruangKategori =
+            clin?.poin3_1?.kategori === 'ISOLASI HEPATITIS B'
+              ? 'Isolasi Hep B'
+              : clin?.poin3_1?.kategori === 'ISOLASI HEPATITIS C/HIV'
+              ? 'Isolasi Hep C'
+              : 'Reguler';
+
+          const aksesLabel =
+            clin?.poin3_6?.femoralAktif || isMeaningfulAccessInput(clin?.poin3_6?.femoral || '')
+              ? 'FEMORAL'
+              : clin?.poin3_6?.cdlAktif || isMeaningfulAccessInput(clin?.poin3_6?.cdl || '')
+              ? 'CDL'
+              : 'AV SHUNT';
+
+          const compInfo = resolveSessionComplicationsFromPoin4_3(
+            clin?.poin4_3 || createEmptyPoin4_3Data()
+          );
+
+          return {
+            id: buildDeterministicPatientSessionId({
+              tanggal: activeDateIso,
+              shift: resolvedShiftLabel,
+              perawatPelaksana: currentNurse.name,
+              noBedMesin: tp.bedNumber,
+              noRm: tp.medicalRecord
+            }),
+            no: idx + 1,
+            tanggal: activeDateIso,
+            shift: resolvedShiftLabel,
+            noRm: tp.medicalRecord || '-',
+            namaPasien: tp.patientName,
+            statusRawat,
+            ruangKategori,
+            noBedMesin: formatBedAndMachineLabel(tp.bedNumber),
+            aksesVaskular: aksesLabel,
+            waktuMulai: times.waktuMulai,
+            waktuSelesai: times.waktuSelesai,
+            durasiJam,
+            bbKering,
+            bbPreHd,
+            bbPostHd,
+            qb,
+            qd,
+            targetUf,
+            ktV,
+            capaianUf,
+            tdPre,
+            tdPost,
+            dialiser: 'High Flux (SAS HF 18)',
+            heparinisasi: clin?.poin3_5?.dosisHeparin?.trim()
+              ? clin.poin3_5.dosisHeparin.trim()
+              : 'Standar (5000 IU)',
+            komplikasiIntraHd: compInfo.complicationNames || 'Tidak ada',
+            tindakanAdvisDpjp:
+              compInfo.doctorAdviceSummary ||
+              compInfo.hypotensionAction ||
+              compInfo.muscleCrampAction ||
+              'Tidak ada',
+            statusMesin: 'Siap Pakai',
+            metodeDisinfeksi: 'Heat Clean',
+            ketTeknis: 'Normal',
+            jamCekRo: resolvedShiftLabel === 'Siang' ? '13:30' : '06:30',
+            kondisiAirRo: 'Memenuhi Syarat',
+            perawatPelaksana: currentNurse.name,
+            statusVerifikasi: rowStatusVerif,
+            verifikatorPjNama: !effKaru ? eff.verifiedBy : undefined,
+            verifikatorKaruNama: effKaru ? eff.verifiedBy : undefined,
+            verifierNotes: eff.verifierNotes || '',
+            revisionRequested: eff.status === 'belum_diajukan' && Boolean(eff.revisionRequested)
+          };
+        });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeShift, activeDateIso, currentNurse.name, patientClinicalDetails, pjVerification]
+  );
+
+  // Auto-sync all active shift patient rows (including 'draft') to Cloud Firestore patient_sessions
+  useEffect(() => {
+    if (!currentNurse.name || currentNurse.name === '-') return;
+    if (isCloudIncomingRef.current) return;
+    if (!isToday) return;
+    if (managedPatients.length === 0) return;
+
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const allShiftPayloads = buildShiftPatientSessionPayloads(
+            managedPatients,
+            patientSubmissions
+          );
+          await Promise.all(
+            allShiftPayloads.map((rowPayload) =>
+              pasienLogbookService.savePatientSession(rowPayload)
+            )
+          );
+        } catch (err) {
+          console.error('Gagal auto-sync draf sesi pasien ke Cloud Firestore:', err);
+        }
+      })();
+    }, 1500);
+
+    return () => clearTimeout(timer);
+  }, [
+    currentNurse.name,
+    isToday,
+    managedPatients,
+    patientSubmissions,
+    buildShiftPatientSessionPayloads
+  ]);
+
   // Sync submitted, verified, and revision-requested patients to Verification Registry & App Sessions
   const syncSubmittedPatientsToRegistryAndSessions = (
     patientsList: ManagedPatient[],
@@ -4479,8 +4644,116 @@ export const Logbook5ButtonsView: React.FC<Logbook5ButtonsViewProps> = ({
         ? 'pj_shift'
         : 'kepala_ruangan';
 
+    const recordId = `sub-${activeRole}-${getNurseStorageKey(currentNurse.name)}-${activeDateIso}-${activeShift}`;
+    const mappedPatientsPayload = trackedPatients.map((p) => {
+      const eff = getEffectivePatientSubmission(p, submissionsMap);
+      return {
+        id: p.id,
+        bedNumber: p.bedNumber,
+        patientName: p.patientName,
+        medicalRecord: p.medicalRecord,
+        status: eff.status,
+        submittedAt: eff.submittedAt,
+        submittedEpoch: eff.submittedEpoch,
+        verifiedAt: eff.verifiedAt,
+        verifiedBy: eff.verifiedBy,
+        verifiedByRole: eff.verifiedByRole,
+        verifierNotes: eff.verifierNotes,
+        revisionRequested: eff.revisionRequested,
+        revisionRequestedAt: eff.revisionRequestedAt,
+        revisionRequestedBy: eff.revisionRequestedBy,
+        revisionRequestedByRole: eff.revisionRequestedByRole,
+        revisionEpoch: eff.revisionEpoch
+      };
+    });
+
+    const spoItemsPayload = OFFICIAL_LOGBOOK_ITEMS.map((spo) => {
+      if (spo.bagian === 1) {
+        return {
+          code: spo.code,
+          verified: Boolean(facilityStatuses[spo.code]),
+          catatan: facilityNotes[spo.code] || ''
+        };
+      }
+      const anyVerified =
+        trackedPatients.length > 0 &&
+        trackedPatients.some((tp) => Boolean(patientStatuses[tp.id]?.[spo.code]));
+      const catatanJoined = trackedPatients
+        .map((tp) => patientNotes[tp.id]?.[spo.code])
+        .filter((v): v is string => Boolean(v && v.trim()))
+        .join(' | ');
+      return {
+        code: spo.code,
+        verified: anyVerified,
+        catatan: catatanJoined
+      };
+    });
+
+    const isKaruApproved = Boolean(
+      headerSubReference.verifiedByRole &&
+        headerSubReference.verifiedByRole.toLowerCase().includes('kepala')
+    );
+
+    const resolvedRecordStatusVerifikasi: 'draft' | 'submitted' | 'verified_pj' | 'verified_karu' =
+      aggregateStatus === 'terverifikasi'
+        ? isKaruApproved
+          ? 'verified_karu'
+          : 'verified_pj'
+        : aggregateStatus === 'diajukan'
+        ? 'submitted'
+        : 'draft';
+
+    const patientSessionPayloads: LaporanPasienRow[] = buildShiftPatientSessionPayloads(
+      patientsList,
+      submissionsMap
+    );
+
+    void (async () => {
+      try {
+        await logbookService.saveRecord({
+          id: recordId,
+          tanggal: activeDateIso,
+          tanggalLabel: activeDate,
+          shift: activeShift,
+          perawatId: getNurseStorageKey(currentNurse.name),
+          namaPerawat: currentNurse.name,
+          nipPerawat: currentNurse.nip,
+          perawatRole: activeRole,
+          targetRole: resolvedTargetRole,
+          targetVerifierName:
+            headerSubReference.targetVerifierName ||
+            defaultTargetVerifier.name ||
+            defaultPjShiftNurse.name,
+          items: spoItemsPayload,
+          facilityStatuses,
+          patientStatuses,
+          clinicalDetails: patientClinicalDetails,
+          statusVerifikasi: resolvedRecordStatusVerifikasi,
+          submittedAt: headerSubReference.submittedAt || formatNowWib(),
+          submittedEpoch: headerSubReference.submittedEpoch,
+          pelaksanaNotes: headerSubReference.notes || '',
+          verifierNotes:
+            aggregateStatus === 'terverifikasi' || hasRevision
+              ? headerSubReference.verifierNotes || ''
+              : '',
+          revisionRequested: aggregateStatus === 'belum_diajukan' && hasRevision,
+          dokterDpjp: selectedDokterDpjp,
+          dokterJaga: selectedDokterJaga,
+          patients: mappedPatientsPayload
+        });
+
+        await Promise.all(
+          patientSessionPayloads.map((rowPayload) =>
+            pasienLogbookService.savePatientSession(rowPayload)
+          )
+        );
+      } catch (cloudSaveErr) {
+        console.error('Gagal menyinkronkan pengajuan logbook ke Cloud Firestore:', cloudSaveErr);
+      }
+    })();
+
     upsertVerificationRegistryEntry({
-      id: `sub-${activeRole}-${getNurseStorageKey(currentNurse.name)}-${activeDateIso}-${activeShift}`,
+      id: recordId,
       submittedNurseName: currentNurse.name,
       submittedNurseNip: currentNurse.nip,
       submittedNurseRole: activeRole,
@@ -4508,27 +4781,7 @@ export const Logbook5ButtonsView: React.FC<Logbook5ButtonsViewProps> = ({
       facilityTotal: facStats.total,
       dokterDpjp: selectedDokterDpjp,
       dokterJaga: selectedDokterJaga,
-      patients: trackedPatients.map((p) => {
-        const eff = getEffectivePatientSubmission(p, submissionsMap);
-        return {
-          id: p.id,
-          bedNumber: p.bedNumber,
-          patientName: p.patientName,
-          medicalRecord: p.medicalRecord,
-          status: eff.status,
-          submittedAt: eff.submittedAt,
-          submittedEpoch: eff.submittedEpoch,
-          verifiedAt: eff.verifiedAt,
-          verifiedBy: eff.verifiedBy,
-          verifiedByRole: eff.verifiedByRole,
-          verifierNotes: eff.verifierNotes,
-          revisionRequested: eff.revisionRequested,
-          revisionRequestedAt: eff.revisionRequestedAt,
-          revisionRequestedBy: eff.revisionRequestedBy,
-          revisionRequestedByRole: eff.revisionRequestedByRole,
-          revisionEpoch: eff.revisionEpoch
-        };
-      })
+      patients: mappedPatientsPayload
     });
 
     if (onSyncNurseSessions) {

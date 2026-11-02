@@ -8,6 +8,11 @@ import {
   formatIsoDateToIndonesianFull,
   getCurrentIsoDateWib
 } from './dateHelpers.ts';
+import {
+  OFFICIAL_LOGBOOK_ITEMS,
+  logbookService,
+  type LogbookHarianRecord
+} from '../data/officialPelaksanaLogbookData.ts';
 
 export const VERIFICATION_REGISTRY_STORAGE_KEY = 'logbook_verification_registry_v5';
 export const PER_PATIENT_STATUS_STORAGE_KEY = 'verifikasi_per_patient_status_v5';
@@ -616,6 +621,90 @@ export function saveVerificationRegistry(entries: LogbookVerificationRegistryEnt
   saveVerificationRegistryCloud(entries).catch(() => {});
 }
 
+export function convertLogbookRecordToRegistryEntry(
+  rec: LogbookHarianRecord,
+  options?: { viewerRole?: SystemAccessRole }
+): LogbookVerificationRegistryEntry {
+  const isKaruViewer = options?.viewerRole === 'kepala_ruangan';
+  // Untuk Kepala Ruang, logbook berstatus 'verified_pj' tampil sebagai 'diajukan' (menunggu pengesahan berjenjang Kepala Ruang)
+  const mappedStatus: 'belum_diajukan' | 'diajukan' | 'terverifikasi' =
+    rec.statusVerifikasi === 'verified_karu'
+      ? 'terverifikasi'
+      : rec.statusVerifikasi === 'verified_pj'
+      ? isKaruViewer
+        ? 'diajukan'
+        : 'terverifikasi'
+      : rec.statusVerifikasi === 'submitted'
+      ? 'diajukan'
+      : 'belum_diajukan';
+
+  const effectiveVerifiedBy =
+    rec.statusVerifikasi === 'verified_karu'
+      ? rec.verifikatorKaruNama || rec.verifikatorKaruId || 'Kepala Ruang'
+      : rec.statusVerifikasi === 'verified_pj'
+      ? rec.verifikatorPjNama || rec.verifikatorPjId || 'PJ Shift'
+      : undefined;
+
+  const effectiveVerifiedByRole =
+    rec.statusVerifikasi === 'verified_karu'
+      ? 'Kepala Ruang'
+      : rec.statusVerifikasi === 'verified_pj'
+      ? 'PJ Shift'
+      : undefined;
+
+  const effectiveVerifiedAt =
+    rec.statusVerifikasi === 'verified_karu'
+      ? rec.verifiedKaruAt || rec.updatedAt
+      : rec.statusVerifikasi === 'verified_pj'
+      ? rec.verifiedPjAt || rec.updatedAt
+      : undefined;
+
+  const facItems = OFFICIAL_LOGBOOK_ITEMS.filter((it) => it.bagian === 1);
+  const facCompleted = Array.isArray(rec.items)
+    ? rec.items.filter((it) => facItems.some((f) => f.code === it.code) && it.verified).length
+    : 0;
+
+  return {
+    id: rec.id,
+    submittedNurseName: rec.namaPerawat,
+    submittedNurseNip: rec.nipPerawat,
+    submittedNurseRole: rec.perawatRole || 'perawat_pelaksana',
+    targetRole:
+      rec.targetRole ||
+      (rec.statusVerifikasi === 'verified_pj' && isKaruViewer ? 'kepala_ruangan' : 'pj_shift'),
+    targetVerifierName: rec.targetVerifierName || '-',
+    status: mappedStatus,
+    shift: rec.shift || 'Pagi',
+    dateKey: rec.tanggal,
+    dateLabel: rec.tanggalLabel || (rec.tanggal ? formatIsoDateToIndonesianFull(rec.tanggal) : undefined),
+    submittedAt: rec.submittedAt || rec.updatedAt,
+    submittedEpoch: rec.submittedEpoch,
+    verifiedAt: mappedStatus === 'terverifikasi' ? effectiveVerifiedAt : undefined,
+    verifiedBy: mappedStatus === 'terverifikasi' ? effectiveVerifiedBy : undefined,
+    verifiedByRole: mappedStatus === 'terverifikasi' ? effectiveVerifiedByRole : undefined,
+    pelaksanaNotes: rec.pelaksanaNotes,
+    verifierNotes: rec.verifierNotes,
+    revisionRequested: rec.revisionRequested,
+    revisionRequestedAt: rec.revisionRequestedAt,
+    revisionRequestedBy: rec.revisionRequestedBy,
+    revisionRequestedByRole: rec.revisionRequestedByRole,
+    revisionEpoch: rec.revisionEpoch,
+    facilityCompleted: facCompleted,
+    facilityTotal: facItems.length,
+    dokterDpjp: rec.dokterDpjp,
+    dokterJaga: rec.dokterJaga,
+    patients: Array.isArray(rec.patients)
+      ? rec.patients.map((p) => ({
+          ...p,
+          status:
+            isKaruViewer && rec.statusVerifikasi === 'verified_pj'
+              ? 'diajukan'
+              : p.status || mappedStatus
+        }))
+      : undefined
+  };
+}
+
 export function upsertVerificationRegistryEntry(entry: LogbookVerificationRegistryEntry): void {
   const current = getVerificationRegistry();
   const index = current.findIndex((e) => {
@@ -644,9 +733,101 @@ export function upsertVerificationRegistryEntry(entry: LogbookVerificationRegist
     updated = [entry, ...current];
   }
   saveVerificationRegistry(updated);
+
+  // Sinkronkan juga ke logbookService agar getPendingVerifications() & getVerifiedReports() selalu mutakhir
+  const existingServiceRec = logbookService
+    .getAllRecords()
+    .find(
+      (r) =>
+        (entry.id && r.id === entry.id) ||
+        (isMatchingNurse(r.namaPerawat, entry.submittedNurseName) &&
+          (!entry.dateKey || !r.tanggal || r.tanggal === entry.dateKey) &&
+          (!entry.shift || !r.shift || String(r.shift).toLowerCase() === String(entry.shift).toLowerCase()))
+    );
+
+  const isKaruVerif = isKepalaRuangVerifier(entry.verifiedByRole, entry.verifiedBy);
+  const nextStatusVerifikasi: LogbookHarianRecord['statusVerifikasi'] =
+    entry.status === 'terverifikasi'
+      ? isKaruVerif || existingServiceRec?.statusVerifikasi === 'verified_karu'
+        ? 'verified_karu'
+        : 'verified_pj'
+      : entry.status === 'diajukan'
+      ? 'submitted'
+      : 'draft';
+
+  const nurseSlug = getNurseStorageKey(entry.submittedNurseName);
+  const dateIso =
+    entry.dateKey ||
+    (entry.dateLabel ? indonesianDateLabelToIso(entry.dateLabel) : '') ||
+    getCurrentIsoDateWib();
+  const shiftName = entry.shift || 'Pagi';
+
+  logbookService.saveRecord({
+    ...(existingServiceRec || {}),
+    id:
+      entry.id ||
+      existingServiceRec?.id ||
+      `sub-${entry.submittedNurseRole || 'perawat_pelaksana'}-${nurseSlug}-${dateIso}-${shiftName}`,
+    tanggal: dateIso,
+    tanggalLabel: entry.dateLabel || existingServiceRec?.tanggalLabel,
+    shift: shiftName,
+    perawatId: existingServiceRec?.perawatId || nurseSlug,
+    namaPerawat: entry.submittedNurseName,
+    nipPerawat: entry.submittedNurseNip || existingServiceRec?.nipPerawat,
+    perawatRole: entry.submittedNurseRole || existingServiceRec?.perawatRole || 'perawat_pelaksana',
+    targetRole: entry.targetRole || existingServiceRec?.targetRole || 'pj_shift',
+    targetVerifierName: entry.targetVerifierName || existingServiceRec?.targetVerifierName,
+    items:
+      existingServiceRec?.items && existingServiceRec.items.length > 0
+        ? existingServiceRec.items
+        : OFFICIAL_LOGBOOK_ITEMS.map((spo) => ({
+            code: spo.code,
+            verified: entry.status === 'terverifikasi',
+            catatan: ''
+          })),
+    statusVerifikasi: nextStatusVerifikasi,
+    verifikatorPjId:
+      nextStatusVerifikasi === 'verified_pj'
+        ? entry.verifiedBy || existingServiceRec?.verifikatorPjId || 'pj_shift'
+        : existingServiceRec?.verifikatorPjId,
+    verifikatorPjNama:
+      nextStatusVerifikasi === 'verified_pj'
+        ? entry.verifiedBy || existingServiceRec?.verifikatorPjNama
+        : existingServiceRec?.verifikatorPjNama,
+    verifiedPjAt:
+      nextStatusVerifikasi === 'verified_pj'
+        ? entry.verifiedAt || existingServiceRec?.verifiedPjAt
+        : existingServiceRec?.verifiedPjAt,
+    verifikatorKaruId:
+      nextStatusVerifikasi === 'verified_karu'
+        ? entry.verifiedBy || existingServiceRec?.verifikatorKaruId || 'kepala_ruangan'
+        : existingServiceRec?.verifikatorKaruId,
+    verifikatorKaruNama:
+      nextStatusVerifikasi === 'verified_karu'
+        ? entry.verifiedBy || existingServiceRec?.verifikatorKaruNama
+        : existingServiceRec?.verifikatorKaruNama,
+    verifiedKaruAt:
+      nextStatusVerifikasi === 'verified_karu'
+        ? entry.verifiedAt || existingServiceRec?.verifiedKaruAt
+        : existingServiceRec?.verifiedKaruAt,
+    submittedAt: entry.submittedAt ?? existingServiceRec?.submittedAt,
+    submittedEpoch: entry.submittedEpoch ?? existingServiceRec?.submittedEpoch,
+    pelaksanaNotes: entry.pelaksanaNotes ?? existingServiceRec?.pelaksanaNotes,
+    verifierNotes: entry.verifierNotes ?? existingServiceRec?.verifierNotes,
+    revisionRequested: entry.revisionRequested ?? existingServiceRec?.revisionRequested,
+    revisionRequestedAt: entry.revisionRequestedAt ?? existingServiceRec?.revisionRequestedAt,
+    revisionRequestedBy: entry.revisionRequestedBy ?? existingServiceRec?.revisionRequestedBy,
+    revisionRequestedByRole:
+      entry.revisionRequestedByRole ?? existingServiceRec?.revisionRequestedByRole,
+    revisionEpoch: entry.revisionEpoch ?? existingServiceRec?.revisionEpoch,
+    dokterDpjp: entry.dokterDpjp || existingServiceRec?.dokterDpjp,
+    dokterJaga: entry.dokterJaga || existingServiceRec?.dokterJaga,
+    patients: entry.patients ?? existingServiceRec?.patients
+  }).catch(() => {});
 }
 
 export function resetVerificationStorageToBenchmark(): void {
+  logbookService.clearAllRecords();
   if (typeof window === 'undefined' || !window.localStorage) return;
   try {
     const keysToRemove: string[] = [];
@@ -751,7 +932,25 @@ export function getNurseVerificationInfo(
     };
   }
 
-  // 2. Check verification registry (primary shared source of truth)
+  // 2. Check logbookService (primary source of truth for verifications & reports)
+  const serviceRecords = logbookService.getAllRecords();
+  const foundService = serviceRecords.find((r) => isMatchingNurse(r.namaPerawat, nurseName));
+  if (foundService) {
+    const mapped = convertLogbookRecordToRegistryEntry(foundService);
+    return {
+      status: mapped.status,
+      isVerified: mapped.status === 'terverifikasi',
+      submittedAt: mapped.submittedAt,
+      verifiedAt: mapped.verifiedAt,
+      verifiedBy: mapped.verifiedBy,
+      verifiedByRole: mapped.verifiedByRole,
+      verifierNotes: mapped.verifierNotes,
+      targetRole: mapped.targetRole,
+      targetVerifierName: mapped.targetVerifierName
+    };
+  }
+
+  // 3. Check verification registry fallback
   const regList = getVerificationRegistry();
   const foundReg = regList.find((e) => isMatchingNurse(e.submittedNurseName, nurseName));
   if (foundReg) {

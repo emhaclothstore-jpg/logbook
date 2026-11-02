@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import {
   ShiftInfo,
   SystemAccessRole,
@@ -12,12 +12,12 @@ import {
 import {
   LaporanPasienRow,
   computeLaporanPasienSummary,
-  convertSessionToLaporanRow,
-  collectAllInputtedLogbookRows
+  pasienLogbookService
 } from '../data/laporanPasienData.ts';
 import {
   normalizeIndonesianDateLabel,
-  indonesianDateLabelToIso
+  indonesianDateLabelToIso,
+  formatIsoDateToIndonesianFull
 } from '../utils/dateHelpers.ts';
 import { printDocumentWithOrientation, downloadElementAsPdf } from '../utils/printHelpers.ts';
 import { aggregateShiftVerifiedLogbooks } from '../utils/dailyReportHelpers.ts';
@@ -32,19 +32,14 @@ import {
   Search,
   Filter,
   RefreshCw,
-  Droplet,
-  CheckCircle2,
   Calendar,
   Clock,
-  User,
   ShieldCheck,
-  Stethoscope,
-  Info,
-  Activity,
-  Layers,
   Book,
   UserPlus,
-  FileSpreadsheet
+  FileSpreadsheet,
+  Loader2,
+  AlertCircle
 } from 'lucide-react';
 import { exportMasterHemodialisaWorkbook } from '../utils/exportMasterSpreadsheet.ts';
 
@@ -65,9 +60,22 @@ interface LaporanPasienViewProps {
   onNavigateToLogbook?: () => void;
 }
 
+function formatVerificationStatusLabel(status: LaporanPasienRow['statusVerifikasi']): string {
+  switch (status) {
+    case 'verified_karu':
+      return 'Verified Ka. Ruang';
+    case 'verified_pj':
+      return 'Verified PJ Shift';
+    case 'submitted':
+      return 'Diajukan';
+    case 'draft':
+    default:
+      return 'Draft Input';
+  }
+}
+
 export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
   shiftInfo,
-  userRole = 'perawat_pelaksana',
   loggedInUserName,
   sessions = [],
   masterNurses = [],
@@ -86,6 +94,7 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
   );
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState<string>('all');
+  const [statusFilter, setStatusFilter] = useState<string>('all');
   const [syncTick, setSyncTick] = useState(0);
 
   // Sync selectedShift whenever parent shift changes
@@ -95,24 +104,94 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
     }
   }, [shiftInfo.shift]);
 
-  // Real-time listener: re-calculate whenever logbook sessions, shift doctors, or verifications are updated
-  useEffect(() => {
-    const handleUpdate = () => setSyncTick((t) => t + 1);
-    window.addEventListener('logbook_sessions_updated', handleUpdate);
-    window.addEventListener('verification_registry_updated', handleUpdate);
-    window.addEventListener('logbook_shift_doctors_updated', handleUpdate);
-    window.addEventListener('storage', handleUpdate);
-    return () => {
-      window.removeEventListener('logbook_sessions_updated', handleUpdate);
-      window.removeEventListener('verification_registry_updated', handleUpdate);
-      window.removeEventListener('logbook_shift_doctors_updated', handleUpdate);
-      window.removeEventListener('storage', handleUpdate);
-    };
-  }, []);
-
   const activeDateFormatted = normalizeIndonesianDateLabel(shiftInfo.date);
   const activeDateIso = indonesianDateLabelToIso(activeDateFormatted);
-  const activeIsoDate = activeDateIso;
+
+  // Active shift date state for Cloud Firestore raw shift report queries
+  const [selectedDateIso, setSelectedDateIso] = useState<string>(activeDateIso);
+  const [isLoadingReport, setIsLoadingReport] = useState<boolean>(true);
+  const [reportError, setReportError] = useState<string | null>(null);
+  const [rawShiftRows, setRawShiftRows] = useState<LaporanPasienRow[]>([]);
+
+  useEffect(() => {
+    setSelectedDateIso(activeDateIso);
+  }, [activeDateIso]);
+
+  const displayDateLabel = formatIsoDateToIndonesianFull(selectedDateIso);
+
+  // Asynchronous Cloud Firestore fetch: tarik seluruh baris logbook pasien pada shift aktif tanpa memandang status verifikasi
+  const fetchRawShiftReports = useCallback(
+    async (tanggalIso: string, shiftName: 'Pagi' | 'Siang') => {
+      setIsLoadingReport(true);
+      setReportError(null);
+      try {
+        const rows = await pasienLogbookService.getRawReportsByShift(tanggalIso, shiftName);
+        setRawShiftRows(rows);
+      } catch (err) {
+        console.error('Gagal mengambil laporan logbook pasien shift dari Cloud Firestore:', err);
+        setReportError(
+          'Gagal memuat data logbook pasien shift dari jaringan Cloud Firestore. Silakan coba muat ulang.'
+        );
+      } finally {
+        setIsLoadingReport(false);
+      }
+    },
+    []
+  );
+
+  // Panggil pasienLogbookService.getRawReportsByShift(tanggal, shift) + real-time subscription onSnapshot
+  useEffect(() => {
+    let isMounted = true;
+    void fetchRawShiftReports(selectedDateIso, selectedShift);
+
+    const unsubRawShift = pasienLogbookService.subscribeRawReportsByShift(
+      selectedDateIso,
+      selectedShift,
+      (rows) => {
+        if (!isMounted) return;
+        setRawShiftRows(rows);
+        setIsLoadingReport(false);
+      },
+      (err) => {
+        console.error('Subscription error pasienLogbookService.subscribeRawReportsByShift:', err);
+        if (!isMounted) return;
+        setReportError(
+          'Sinkronisasi real-time Cloud Firestore terganggu. Klik tombol muat ulang untuk menyegarkan data.'
+        );
+        setIsLoadingReport(false);
+      }
+    );
+
+    const handleLocalSync = () => {
+      setSyncTick((t) => t + 1);
+      void pasienLogbookService
+        .getRawReportsByShift(selectedDateIso, selectedShift)
+        .then((rows) => {
+          if (isMounted) {
+            setRawShiftRows(rows);
+          }
+        })
+        .catch((err) => {
+          console.error('Gagal menyegarkan data shift lokal/cloud:', err);
+        });
+    };
+
+    window.addEventListener('logbook_records_updated', handleLocalSync);
+    window.addEventListener('logbook_sessions_updated', handleLocalSync);
+    window.addEventListener('verification_registry_updated', handleLocalSync);
+    window.addEventListener('logbook_shift_doctors_updated', handleLocalSync);
+    window.addEventListener('storage', handleLocalSync);
+
+    return () => {
+      isMounted = false;
+      unsubRawShift();
+      window.removeEventListener('logbook_records_updated', handleLocalSync);
+      window.removeEventListener('logbook_sessions_updated', handleLocalSync);
+      window.removeEventListener('verification_registry_updated', handleLocalSync);
+      window.removeEventListener('logbook_shift_doctors_updated', handleLocalSync);
+      window.removeEventListener('storage', handleLocalSync);
+    };
+  }, [selectedDateIso, selectedShift, fetchRawShiftReports]);
 
   // Resolve PJ Shift, Dokter Jaga Ruangan, and Kepala Ruang for the selected date & shift
   const shiftSignatories = useMemo(() => {
@@ -126,26 +205,29 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
       nurseSchedules,
       doctorSchedules,
       cloudNurseLogbooks,
-      activeDateLabel: activeDateFormatted,
+      activeDateLabel: formatIsoDateToIndonesianFull(selectedDateIso),
       activeShift: selectedShift,
       loggedInUserName,
       fallbackShiftInfo: shiftInfo
     });
 
-    const pjName = summaryForShift.pjShiftName && summaryForShift.pjShiftName !== '-'
-      ? summaryForShift.pjShiftName
-      : shiftInfo.pjShift || '-';
+    const pjName =
+      summaryForShift.pjShiftName && summaryForShift.pjShiftName !== '-'
+        ? summaryForShift.pjShiftName
+        : shiftInfo.pjShift || '-';
     const pjMaster = masterNurses.find((n) => isMatchingNurse(n.name, pjName));
 
-    const dokterJagaName = summaryForShift.dokterJagaName && summaryForShift.dokterJagaName !== '-'
-      ? summaryForShift.dokterJagaName
-      : shiftInfo.dokterJaga || '-';
+    const dokterJagaName =
+      summaryForShift.dokterJagaName && summaryForShift.dokterJagaName !== '-'
+        ? summaryForShift.dokterJagaName
+        : shiftInfo.dokterJaga || '-';
     const cleanJagaLower = dokterJagaName.trim().toLowerCase();
     const dokterJagaMaster = masterDoctors.find(
       (d) => d.name.trim().toLowerCase() === cleanJagaLower
     );
 
-    const kepalaRuangName = summaryForShift.kepalaRuanganName || shiftInfo.kepalaRuangan || 'TWIS FERTILIANTI PW';
+    const kepalaRuangName =
+      summaryForShift.kepalaRuanganName || shiftInfo.kepalaRuangan || 'TWIS FERTILIANTI PW';
     const kepalaRuangMaster = masterNurses.find((n) => isMatchingNurse(n.name, kepalaRuangName));
 
     return {
@@ -165,67 +247,82 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
     nurseSchedules,
     doctorSchedules,
     cloudNurseLogbooks,
-    activeDateFormatted,
+    selectedDateIso,
     selectedShift,
     loggedInUserName,
     shiftInfo
   ]);
 
-  // Compute live rows from all inputted logbooks matching the active date & selected shift
-  const liveRows = useMemo(() => {
-    return collectAllInputtedLogbookRows({
-      sessions,
-      activeDateIso,
-      activeShift: selectedShift,
-      masterNurses,
-      masterPatients
+  // Seluruh baris logbook pasien pada shift aktif tanpa memandang status verifikasi
+  const rawRows: LaporanPasienRow[] = rawShiftRows;
+
+  // Hitung rincian status verifikasi untuk informasi real-time shift
+  const statusCounts = useMemo(() => {
+    let draft = 0;
+    let submitted = 0;
+    let verifiedPj = 0;
+    let verifiedKaru = 0;
+    rawRows.forEach((r) => {
+      if (r.statusVerifikasi === 'verified_karu') verifiedKaru += 1;
+      else if (r.statusVerifikasi === 'verified_pj') verifiedPj += 1;
+      else if (r.statusVerifikasi === 'submitted') submitted += 1;
+      else draft += 1;
     });
-  }, [sessions, activeDateIso, selectedShift, masterNurses, masterPatients, syncTick]);
+    return { draft, submitted, verifiedPj, verifiedKaru };
+  }, [rawRows]);
 
-  // Base rows based purely on live inputted logbook
-  const rawRows: LaporanPasienRow[] = liveRows;
-
-  // Filtered rows by search and category
+  // Filtered rows by search, category, and optional status filter
   const filteredRows = useMemo(() => {
-    return rawRows.filter((row) => {
-      // Category filter
-      if (categoryFilter !== 'all') {
-        if (categoryFilter === 'reguler' && row.ruangKategori !== 'Reguler') return false;
-        if (categoryFilter === 'hepb' && !row.ruangKategori.toLowerCase().includes('hep b')) return false;
-        if (categoryFilter === 'hepc' && !row.ruangKategori.toLowerCase().includes('hep c')) return false;
-        if (categoryFilter === 'ranap' && row.statusRawat !== 'Rawat Inap') return false;
-      }
-
-      // Search query
-      if (searchQuery.trim()) {
-        const q = searchQuery.toLowerCase().trim();
-        const matchName = row.namaPasien.toLowerCase().includes(q);
-        const matchRm = row.noRm.toLowerCase().includes(q);
-        const matchBed = row.noBedMesin.toLowerCase().includes(q);
-        const matchNurse = row.perawatPelaksana.toLowerCase().includes(q);
-        const matchAccess = row.aksesVaskular.toLowerCase().includes(q);
-        if (!matchName && !matchRm && !matchBed && !matchNurse && !matchAccess) {
+    return rawRows
+      .filter((row) => {
+        if (statusFilter !== 'all' && row.statusVerifikasi !== statusFilter) {
           return false;
         }
-      }
 
-      return true;
-    });
-  }, [rawRows, categoryFilter, searchQuery]);
+        if (categoryFilter !== 'all') {
+          if (categoryFilter === 'reguler' && row.ruangKategori !== 'Reguler') return false;
+          if (categoryFilter === 'hepb' && !row.ruangKategori.toLowerCase().includes('hep b')) {
+            return false;
+          }
+          if (categoryFilter === 'hepc' && !row.ruangKategori.toLowerCase().includes('hep c')) {
+            return false;
+          }
+          if (categoryFilter === 'ranap' && row.statusRawat !== 'Rawat Inap') return false;
+        }
+
+        if (searchQuery.trim()) {
+          const q = searchQuery.toLowerCase().trim();
+          const matchName = row.namaPasien.toLowerCase().includes(q);
+          const matchRm = row.noRm.toLowerCase().includes(q);
+          const matchBed = row.noBedMesin.toLowerCase().includes(q);
+          const matchNurse = row.perawatPelaksana.toLowerCase().includes(q);
+          const matchAccess = row.aksesVaskular.toLowerCase().includes(q);
+          const matchStatus = formatVerificationStatusLabel(row.statusVerifikasi)
+            .toLowerCase()
+            .includes(q);
+          if (!matchName && !matchRm && !matchBed && !matchNurse && !matchAccess && !matchStatus) {
+            return false;
+          }
+        }
+
+        return true;
+      })
+      .map((r, idx) => ({ ...r, no: idx + 1 }));
+  }, [rawRows, statusFilter, categoryFilter, searchQuery]);
 
   const summary = useMemo(() => computeLaporanPasienSummary(filteredRows), [filteredRows]);
 
   const [isExportingPdf, setIsExportingPdf] = useState(false);
 
   const handlePrint = () => {
-    const docTitle = `Laporan_Pasien_HD_Shift_${selectedShift}_${activeDateIso}`;
+    const docTitle = `Laporan_Pasien_HD_Shift_${selectedShift}_${selectedDateIso}`;
     printDocumentWithOrientation(true, docTitle);
   };
 
   const handleDownloadPdf = async () => {
     setIsExportingPdf(true);
     try {
-      const docTitle = `Laporan_Pasien_HD_Shift_${selectedShift}_${activeDateIso}`;
+      const docTitle = `Laporan_Pasien_HD_Shift_${selectedShift}_${selectedDateIso}`;
       await downloadElementAsPdf('printable-patient-report', {
         filename: docTitle,
         isLandscape: true,
@@ -254,21 +351,25 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
 
   return (
     <div className="space-y-4 pb-12">
-
       {/* ===================================================================== */}
       {/* TOP HEADER & DOCUMENT BANNER (SCREEN ONLY)                            */}
       {/* ===================================================================== */}
-      <div className="bg-white/85 backdrop-blur-md rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-xs print:hidden space-y-4">
+      <div className="bg-white/90 backdrop-blur-md rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-xs print:hidden space-y-4">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div>
             <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-[#185382]">
               <span>Unit Hemodialisa</span>
               <span aria-hidden="true">·</span>
               <span>RS Happy Land Medical Centre</span>
+              <span aria-hidden="true">·</span>
+              <span className="text-slate-600 font-medium">Real-time Seluruh Input Shift</span>
             </div>
             <h1 className="text-lg sm:text-xl font-black text-slate-950 mt-1 uppercase tracking-tight">
               LAPORAN PASIEN: DETAIL PELAYANAN ASUHAN KEPERAWATAN &amp; MEDIS
             </h1>
+            <p className="text-xs text-slate-600 mt-0.5">
+              Menampilkan seluruh baris logbook pasien yang diinput oleh perawat pada shift aktif secara real-time dari Cloud Firestore (Draft, Diajukan, Verified PJ Shift, dan Verified Ka. Ruang).
+            </p>
           </div>
 
           {/* Action buttons */}
@@ -277,7 +378,7 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
               <button
                 type="button"
                 onClick={onNavigateToLogbook}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold transition-all shadow-2xs cursor-pointer whitespace-nowrap"
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold transition-all shadow-2xs cursor-pointer whitespace-nowrap shrink-0"
               >
                 <Book className="w-4 h-4 text-[#19588f]" />
                 <span>Buka Input Logbook</span>
@@ -286,7 +387,7 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
             <button
               type="button"
               onClick={handlePrint}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold transition-all shadow-sm cursor-pointer whitespace-nowrap"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold transition-all shadow-sm cursor-pointer whitespace-nowrap shrink-0"
               title="Buka dialog cetak browser langsung (A4 Landscape)"
             >
               <Printer className="w-4 h-4" />
@@ -296,7 +397,7 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
               type="button"
               onClick={handleDownloadPdf}
               disabled={isExportingPdf}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white text-xs font-bold transition-all shadow-sm cursor-pointer whitespace-nowrap"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white text-xs font-bold transition-all shadow-sm cursor-pointer whitespace-nowrap shrink-0"
               title="Download file tabel pasien langsung sebagai PDF (.pdf)"
             >
               <FileDown className="w-4 h-4" />
@@ -305,8 +406,8 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
             <button
               type="button"
               onClick={handleExportMasterSpreadsheet}
-              className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold transition-all shadow-sm cursor-pointer whitespace-nowrap"
-              title="Coba unduh 1 File Master Excel (.xlsx) yang menggabungkan Laporan Pasien, Laporan PJ Shift, dan Rekapitulasi Bulanan Semua Perawat"
+              className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold transition-all shadow-sm cursor-pointer whitespace-nowrap shrink-0"
+              title="Unduh 1 File Master Excel (.xlsx) yang menggabungkan Laporan Pasien, Laporan PJ Shift, dan Rekapitulasi Bulanan Semua Perawat"
             >
               <FileSpreadsheet className="w-4 h-4 shrink-0" />
               <span>Master Excel (Semua Laporan)</span>
@@ -316,56 +417,104 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
 
         {/* Shift metadata bar */}
         <div className="pt-3 border-t border-slate-200/80 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-700">
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <span className="inline-flex items-center gap-1.5 font-semibold text-slate-900">
               <Clock className="w-3.5 h-3.5 text-[#19588f]" />
-              Shift: <span className="text-[#19588f]">{selectedShift} ({selectedShift === 'Pagi' ? '07.00 - 14.00 WIB' : '14.00 - 21.00 WIB'})</span>
+              Shift:{' '}
+              <span className="text-[#19588f]">
+                {selectedShift} ({selectedShift === 'Pagi' ? '07.00 - 14.00 WIB' : '14.00 - 21.00 WIB'})
+              </span>
             </span>
-            <span className="text-slate-300">|</span>
+            <span aria-hidden="true" className="text-slate-300">·</span>
             <span className="inline-flex items-center gap-1.5">
               <Calendar className="w-3.5 h-3.5 text-slate-500" />
-              Hari/Tanggal: <strong>{activeDateFormatted}</strong>
+              Hari/Tanggal: <strong>{displayDateLabel}</strong>
             </span>
-            <span className="text-slate-300">|</span>
-            <span>PJ Shift: <strong>{shiftInfo.pjShift || 'M. Haikal Malilang, A.Md. Kep.'}</strong></span>
-            <span className="text-slate-300">|</span>
+            <span aria-hidden="true" className="text-slate-300">·</span>
+            <span>PJ Shift: <strong>{shiftSignatories.pjName}</strong></span>
+            <span aria-hidden="true" className="text-slate-300">·</span>
             <span>DPJP: <strong>{shiftInfo.dokterDpjp || 'dr. Raden Heru Prasanto, Sp.PD-KGH'}</strong></span>
-            <span className="text-slate-300">|</span>
-            <span>Ka. Ruang: <strong>{shiftInfo.kepalaRuangan || 'Twis Fertilianti PW., S.Kep., Ns.'}</strong></span>
+            <span aria-hidden="true" className="text-slate-300">·</span>
+            <span>Ka. Ruang: <strong>{shiftSignatories.kepalaRuangName}</strong></span>
           </div>
 
-          {/* Status Sinkronisasi Data Input Logbook */}
-          <div className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-50 border border-emerald-200/80 rounded-xl text-[11px] font-bold text-emerald-800 shadow-2xs">
-            <span className={`w-2 h-2 rounded-full ${liveRows.length > 0 ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'}`} />
-            <span>Data Input Logbook Terintegrasi ({liveRows.length} Pasien)</span>
+          {/* Status Sinkronisasi Real-time Cloud Firestore (Semua Status Verifikasi) */}
+          <div className="flex flex-wrap items-center gap-2.5 tabular-nums">
+            <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-semibold text-slate-600">
+              {isLoadingReport ? (
+                <span className="inline-flex items-center gap-1.5 text-[#19588f] font-bold">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                  <span>Menarik data shift dari Cloud Firestore...</span>
+                </span>
+              ) : (
+                <>
+                  <ShieldCheck className="w-3.5 h-3.5 text-[#19588f] shrink-0" />
+                  <span className="font-bold text-slate-900">Total Input: {rawRows.length}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>Draft: {statusCounts.draft}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>Diajukan: {statusCounts.submitted}</span>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-blue-800">Verified PJ: {statusCounts.verifiedPj}</span>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-emerald-800">Verified Ka. Ruang: {statusCounts.verifiedKaru}</span>
+                </>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => void fetchRawShiftReports(selectedDateIso, selectedShift)}
+              disabled={isLoadingReport}
+              title="Muat ulang seluruh baris logbook shift dari Cloud Firestore"
+              className="p-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 transition-colors cursor-pointer shrink-0"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isLoadingReport ? 'animate-spin' : ''}`} />
+            </button>
           </div>
         </div>
       </div>
 
+      {/* Cloud Network Error Banner */}
+      {reportError && (
+        <div className="bg-rose-50 border border-rose-200 rounded-2xl p-3.5 flex flex-wrap items-center justify-between gap-3 text-xs text-rose-900 print:hidden">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+            <span className="font-semibold">{reportError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => void fetchRawShiftReports(selectedDateIso, selectedShift)}
+            className="px-3.5 py-1.5 rounded-xl bg-rose-700 hover:bg-rose-800 text-white font-bold cursor-pointer whitespace-nowrap shrink-0"
+          >
+            Coba Lagi
+          </button>
+        </div>
+      )}
+
       {/* ===================================================================== */}
       {/* FILTER & SEARCH BAR (SCREEN ONLY)                                     */}
       {/* ===================================================================== */}
-      <div className="bg-white/80 backdrop-blur-md rounded-2xl p-3 border border-slate-200/80 shadow-xs flex flex-wrap items-center justify-between gap-3 print:hidden">
+      <div className="bg-white/85 backdrop-blur-md rounded-2xl p-3 border border-slate-200/80 shadow-xs flex flex-wrap items-center justify-between gap-3 print:hidden">
         {/* Search input */}
         <div className="relative flex-1 min-w-[220px] max-w-md">
           <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
           <input
             type="text"
-            placeholder="Cari Nama Pasien, No. RM, Bed, Perawat..."
+            placeholder="Cari Nama Pasien, No. RM, Bed, Perawat, Status..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full pl-9 pr-3 py-1.5 rounded-xl border border-slate-200 text-xs text-slate-900 placeholder:text-slate-400 bg-white focus:outline-hidden focus:border-[#19588f] focus:ring-2 focus:ring-[#19588f]/10"
           />
         </div>
 
-        {/* Filter Badges & Controls */}
+        {/* Filter Controls */}
         <div className="flex flex-wrap items-center gap-2">
           {/* Shift Switcher */}
           <div className="flex items-center gap-1 bg-slate-100 p-0.5 rounded-xl border border-slate-200 text-xs font-bold">
             <button
               type="button"
               onClick={() => setSelectedShift('Pagi')}
-              className={`px-3 py-1 rounded-lg transition-colors cursor-pointer ${
+              className={`px-3 py-1 rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                 selectedShift === 'Pagi'
                   ? 'bg-[#19588f] text-white shadow-2xs'
                   : 'text-slate-600 hover:text-slate-900'
@@ -376,7 +525,7 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
             <button
               type="button"
               onClick={() => setSelectedShift('Siang')}
-              className={`px-3 py-1 rounded-lg transition-colors cursor-pointer ${
+              className={`px-3 py-1 rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                 selectedShift === 'Siang'
                   ? 'bg-[#19588f] text-white shadow-2xs'
                   : 'text-slate-600 hover:text-slate-900'
@@ -386,16 +535,33 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
             </button>
           </div>
 
+          {/* Verification Status Filter (Default: Semua Status Tanpa Memandang Verifikasi) */}
+          <div className="flex items-center gap-1.5 bg-slate-100 px-2.5 py-1 rounded-xl border border-slate-200 text-xs font-semibold text-slate-700 tabular-nums">
+            <ShieldCheck className="w-3.5 h-3.5 text-[#19588f] shrink-0" />
+            <select
+              aria-label="Filter Status Verifikasi"
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              className="bg-transparent font-bold text-slate-900 border-none outline-hidden cursor-pointer"
+            >
+              <option value="all">Semua Status ({rawRows.length})</option>
+              <option value="draft">Draft Input ({statusCounts.draft})</option>
+              <option value="submitted">Diajukan ({statusCounts.submitted})</option>
+              <option value="verified_pj">Verified PJ Shift ({statusCounts.verifiedPj})</option>
+              <option value="verified_karu">Verified Ka. Ruang ({statusCounts.verifiedKaru})</option>
+            </select>
+          </div>
+
           {/* Category Dropdown */}
-          <div className="flex items-center gap-1.5 bg-slate-100 px-2.5 py-1 rounded-xl border border-slate-200 text-xs font-semibold text-slate-700">
-            <Filter className="w-3.5 h-3.5 text-slate-500" />
+          <div className="flex items-center gap-1.5 bg-slate-100 px-2.5 py-1 rounded-xl border border-slate-200 text-xs font-semibold text-slate-700 tabular-nums">
+            <Filter className="w-3.5 h-3.5 text-slate-500 shrink-0" />
             <select
               aria-label="Filter Kategori Pasien"
               value={categoryFilter}
               onChange={(e) => setCategoryFilter(e.target.value)}
               className="bg-transparent font-bold text-slate-900 border-none outline-hidden cursor-pointer"
             >
-              <option value="all">Semua Pasien ({rawRows.length})</option>
+              <option value="all">Semua Kategori</option>
               <option value="reguler">Reguler</option>
               <option value="hepb">Isolasi Hep B</option>
               <option value="hepc">Isolasi Hep C</option>
@@ -403,104 +569,133 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
             </select>
           </div>
 
-          {/* Interactive Date Picker */}
-          {onDateChange && (
-            <div className="flex items-center gap-1 bg-slate-100 px-2.5 py-1 rounded-xl border border-slate-200 text-xs font-semibold text-slate-700">
-              <Calendar className="w-3.5 h-3.5 text-[#19588f]" />
-              <input
-                type="date"
-                aria-label="Pilih Hari dan Tanggal Laporan Pasien"
-                value={activeIsoDate}
-                onChange={(e) => {
-                  if (e.target.value) onDateChange(e.target.value);
+          {/* Interactive Date Picker (Memicu getRawReportsByShift(tanggal, shift)) */}
+          <div className="flex flex-wrap items-center gap-1.5 bg-slate-100 px-2.5 py-1 rounded-xl border border-slate-200 text-xs font-semibold text-slate-700 tabular-nums">
+            <Calendar className="w-3.5 h-3.5 text-[#19588f] shrink-0" />
+            <span className="text-[11px] text-slate-500">Tanggal:</span>
+            <input
+              type="date"
+              aria-label="Tanggal Shift Laporan Pasien"
+              value={selectedDateIso}
+              onChange={(e) => {
+                const nextVal = e.target.value;
+                if (!nextVal) return;
+                setSelectedDateIso(nextVal);
+                if (onDateChange) {
+                  onDateChange(nextVal);
+                }
+              }}
+              className="bg-transparent font-bold text-slate-900 border-none outline-hidden cursor-pointer text-xs"
+            />
+            {(isCustomDate || selectedDateIso !== activeDateIso) && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (onResetDateToToday) {
+                    onResetDateToToday();
+                  } else {
+                    setSelectedDateIso(activeDateIso);
+                  }
                 }}
-                className="bg-transparent font-bold text-slate-900 border-none outline-hidden cursor-pointer text-xs"
-              />
-              {isCustomDate && onResetDateToToday && (
-                <button
-                  type="button"
-                  onClick={onResetDateToToday}
-                  className="ml-1 text-[10px] font-bold text-[#19588f] hover:underline cursor-pointer"
-                >
-                  Hari Ini
-                </button>
-              )}
-            </div>
-          )}
+                className="ml-1 text-[10px] font-bold text-[#19588f] hover:underline cursor-pointer whitespace-nowrap shrink-0"
+              >
+                Hari Ini
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
       {/* ===================================================================== */}
       {/* SUMMARY KPI CARDS (SCREEN ONLY)                                       */}
       {/* ===================================================================== */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-2.5 print:hidden">
-        <div className="p-3 rounded-2xl bg-white/85 border border-slate-200/80 shadow-2xs">
-          <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">Total Pasien</span>
-          <span className="text-xl font-black text-slate-950 block mt-0.5 tabular-nums">
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-2.5 print:hidden tabular-nums">
+        <div className="p-3 rounded-2xl bg-white/90 border border-slate-200/80 shadow-2xs">
+          <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">
+            Pasien Shift Ini
+          </span>
+          <span className="text-xl font-black text-slate-950 block mt-0.5">
             {summary.totalPasien} <span className="text-xs font-normal text-slate-600">Pasien</span>
           </span>
         </div>
 
-        <div className="p-3 rounded-2xl bg-white/85 border border-slate-200/80 shadow-2xs">
-          <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">Total UF Ditarik</span>
-          <span className="text-xl font-black text-[#19588f] block mt-0.5 tabular-nums">
-            {summary.totalCapaianUf.toLocaleString('id-ID')} <span className="text-xs font-normal text-slate-600">mL</span>
+        <div className="p-3 rounded-2xl bg-white/90 border border-slate-200/80 shadow-2xs">
+          <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">
+            Total UF Ditarik
+          </span>
+          <span className="text-xl font-black text-[#19588f] block mt-0.5">
+            {summary.totalCapaianUf.toLocaleString('id-ID')}{' '}
+            <span className="text-xs font-normal text-slate-600">mL</span>
           </span>
         </div>
 
-        <div className="p-3 rounded-2xl bg-white/85 border border-slate-200/80 shadow-2xs">
-          <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">Rata-rata Kt/V</span>
-          <span className="text-xl font-black text-emerald-700 block mt-0.5 tabular-nums">
+        <div className="p-3 rounded-2xl bg-white/90 border border-slate-200/80 shadow-2xs">
+          <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">
+            Rata-rata Kt/V
+          </span>
+          <span className="text-xl font-black text-emerald-700 block mt-0.5">
             {summary.rataKtV} <span className="text-xs font-normal text-slate-600">(&ge; 1,20)</span>
           </span>
         </div>
 
-        <div className="p-3 rounded-2xl bg-white/85 border border-slate-200/80 shadow-2xs">
-          <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">Rata-rata QB</span>
-          <span className="text-xl font-black text-slate-900 block mt-0.5 tabular-nums">
+        <div className="p-3 rounded-2xl bg-white/90 border border-slate-200/80 shadow-2xs">
+          <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">
+            Rata-rata QB
+          </span>
+          <span className="text-xl font-black text-slate-900 block mt-0.5">
             {summary.rataQb} <span className="text-xs font-normal text-slate-600">mL/m</span>
           </span>
         </div>
 
-        <div className="p-3 rounded-2xl bg-white/85 border border-slate-200/80 shadow-2xs">
-          <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">Rata-rata Durasi</span>
-          <span className="text-xl font-black text-slate-900 block mt-0.5 tabular-nums">
+        <div className="p-3 rounded-2xl bg-white/90 border border-slate-200/80 shadow-2xs">
+          <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">
+            Rata-rata Durasi
+          </span>
+          <span className="text-xl font-black text-slate-900 block mt-0.5">
             {summary.rataDurasiJam} <span className="text-xs font-normal text-slate-600">Jam</span>
           </span>
         </div>
 
-        <div className="p-3 rounded-2xl bg-white/85 border border-slate-200/80 shadow-2xs">
-          <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">Mutu Air RO</span>
-          <span className="text-xs font-extrabold text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-2 py-1 inline-block mt-1">
-            Memenuhi Syarat
+        <div className="p-3 rounded-2xl bg-white/90 border border-slate-200/80 shadow-2xs">
+          <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider block">
+            Mutu Air RO
+          </span>
+          <span className="text-sm font-extrabold text-emerald-800 block mt-1">
+            {summary.totalPasien > 0
+              ? `${summary.roMemenuhiSyaratCount}/${summary.totalPasien} Memenuhi`
+              : 'Siap Pakai'}
           </span>
         </div>
       </div>
 
       {/* ===================================================================== */}
       {/* THE OFFICIAL FORMAT TABLE (SCREEN & PRINT)                            */}
-      {/* Exact replica of LAPORAN_PASIEN_86bd5613.pdf                         */}
       {/* ===================================================================== */}
       <div
         id="printable-patient-report"
         className="printable-sheet bg-white rounded-2xl border border-slate-200/90 shadow-sm overflow-hidden print:border-none print:shadow-none print:rounded-none"
       >
-        {/* Printable Document Title Block (Always shown in print, also top of table on screen) */}
+        {/* Printable Document Title Block */}
         <div className="p-3.5 sm:p-4 bg-gradient-to-r from-[#173a64] via-[#1d4c82] to-[#173a64] text-white border-b border-slate-200 print:bg-white print:text-black print:p-2 print:border-b-2 print:border-black">
           <div className="text-center">
             <h2 className="text-sm sm:text-base font-black tracking-wide uppercase print:text-xs print:font-extrabold">
               LOGBOOK DETAIL PELAYANAN ASUHAN KEPERAWATAN &amp; MEDIS PASIEN HEMODIALISIS
             </h2>
             <div className="text-[10.5px] sm:text-[11px] text-blue-100 mt-1 flex flex-wrap items-center justify-center gap-x-2.5 gap-y-0.5 print:text-[8.5px] print:text-black">
-              <span>Shift: <strong>{selectedShift} ({selectedShift === 'Pagi' ? '07.00 - 14.00 WIB' : '14.00 - 21.00 WIB'})</strong></span>
-              <span className="hidden sm:inline">|</span>
-              <span>Hari/Tanggal: <strong>{activeDateFormatted}</strong></span>
-              <span className="hidden sm:inline">|</span>
-              <span>PJ Shift: <strong>{shiftInfo.pjShift || 'M. Haikal Malilang, A.Md. Kep.'}</strong></span>
-              <span className="hidden sm:inline">|</span>
+              <span>
+                Shift:{' '}
+                <strong>
+                  {selectedShift} ({selectedShift === 'Pagi' ? '07.00 - 14.00 WIB' : '14.00 - 21.00 WIB'})
+                </strong>
+              </span>
+              <span className="hidden sm:inline">·</span>
+              <span>Hari/Tanggal: <strong>{displayDateLabel}</strong></span>
+              <span className="hidden sm:inline">·</span>
+              <span>PJ Shift: <strong>{shiftSignatories.pjName}</strong></span>
+              <span className="hidden sm:inline">·</span>
               <span>DPJP: <strong>{shiftInfo.dokterDpjp || 'dr. Raden Heru Prasanto, Sp.PD-KGH'}</strong></span>
-              <span className="hidden sm:inline">|</span>
-              <span>Ka. Ruang: <strong>{shiftInfo.kepalaRuangan || 'Twis Fertilianti PW., S.Kep., Ns.'}</strong></span>
+              <span className="hidden sm:inline">·</span>
+              <span>Ka. Ruang: <strong>{shiftSignatories.kepalaRuangName}</strong></span>
             </div>
           </div>
         </div>
@@ -508,9 +703,8 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
         {/* Horizontal Scrollable Table Wrapper */}
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse border border-slate-300 print:border-black text-[9px] sm:text-[10px] xl:text-[10.5px] font-sans leading-tight print:text-[7.5px] print:leading-none">
-            {/* 2-TIER TABLE HEADER */}
+            {/* 2-TIER TABLE HEADER (31 COLUMNS) */}
             <thead>
-              {/* Row 1: High Level Grouped Headers */}
               <tr className="bg-[#1f4e79] text-white text-center font-bold tracking-tight print:bg-slate-200 print:text-black">
                 <th
                   rowSpan={2}
@@ -573,68 +767,85 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
                   STATUS MUTU WATER TREATMENT RO
                 </th>
                 <th
-                  rowSpan={2}
-                  className="border border-slate-300 print:border-black p-1 sm:p-1.5 text-center align-middle uppercase w-24 sm:w-28"
+                  colSpan={2}
+                  className="border border-slate-300 print:border-black p-1 sm:p-1.5 text-center align-middle uppercase"
                 >
-                  PERAWAT PELAKSANA
+                  PERAWAT &amp; VERIFIKASI
                 </th>
               </tr>
 
-              {/* Row 2: Sub-column Specific Headers */}
               <tr className="bg-[#2f5597] text-white text-center font-bold text-[8.5px] sm:text-[9.5px] print:bg-slate-100 print:text-black">
-                {/* Under DATA IDENTITAS */}
+                {/* DATA IDENTITAS */}
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">NO. RM</th>
                 <th className="border border-slate-300 print:border-black p-1 min-w-[120px] sm:min-w-[140px]">NAMA LENGKAP PASIEN</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">STATUS RAWAT</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">RUANG / KATEGORI</th>
 
-                {/* Under PENGATURAN TEKNIS */}
+                {/* PENGATURAN TEKNIS */}
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">NO. BED / MESIN</th>
-                <th className="border border-slate-300 print:border-black p-1 min-w-[120px]">AKSES VASKULAR</th>
+                <th className="border border-slate-300 print:border-black p-1 min-w-[110px]">AKSES VASKULAR</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">WAKTU MULAI</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">WAKTU SELESAI</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">DURASI (JAM)</th>
 
-                {/* Under PARAMETER BERAT BADAN & ALIRAN */}
+                {/* PARAMETER BERAT BADAN & ALIRAN */}
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">BB KERING (KG)</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">BB PRE HD (KG)</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">BB POST HD (KG)</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">QB (ML/M)</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">QD (ML/M)</th>
 
-                {/* Under MONITORING ULTRAFILTRASI */}
+                {/* MONITORING ULTRAFILTRASI */}
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">TARGET UF (ML)</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">KT/V</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">CAPAIAN UF (ML)</th>
 
-                {/* Under TANDA VITAL */}
+                {/* TANDA VITAL */}
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">TD PRE (MMHG)</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">TD POST (MMHG)</th>
 
-                {/* Under SPESIFIKASI DIALISER & HEPARINISASI */}
+                {/* SPESIFIKASI DIALISER & HEPARINISASI */}
                 <th className="border border-slate-300 print:border-black p-1 min-w-[110px]">DIALISER</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">HEPARINISASI</th>
 
-                {/* Under KOMPLIKASI, TATALAKSANA & ADVIS DPJP */}
+                {/* KOMPLIKASI, TATALAKSANA & ADVIS DPJP */}
                 <th className="border border-slate-300 print:border-black p-1 min-w-[95px]">KOMPLIKASI INTRA-HD</th>
-                <th className="border border-slate-300 print:border-black p-1 min-w-[160px] sm:min-w-[200px]">TINDAKAN &amp; ADVIS MEDIS DPJP</th>
+                <th className="border border-slate-300 print:border-black p-1 min-w-[150px] sm:min-w-[190px]">TINDAKAN &amp; ADVIS MEDIS DPJP</th>
 
-                {/* Under STATUS OPERASIONAL MESIN & DISINFEKSI */}
+                {/* STATUS OPERASIONAL MESIN & DISINFEKSI */}
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">STATUS MESIN</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">METODE DISINFEKSI</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">KET. TEKNIS</th>
 
-                {/* Under STATUS MUTU WATER TREATMENT RO */}
+                {/* STATUS MUTU WATER TREATMENT RO */}
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">JAM CEK RO</th>
                 <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">KONDISI AIR RO</th>
+
+                {/* PERAWAT & STATUS VERIFIKASI */}
+                <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">PERAWAT PELAKSANA</th>
+                <th className="border border-slate-300 print:border-black p-1 whitespace-nowrap">STATUS VERIFIKASI</th>
               </tr>
             </thead>
 
             {/* TABLE BODY */}
             <tbody className="divide-y divide-slate-200 text-slate-800 tabular-nums">
-              {filteredRows.length === 0 ? (
+              {isLoadingReport && filteredRows.length === 0 ? (
+                Array.from({ length: 5 }).map((_, skelIdx) => (
+                  <tr key={`skel-row-${skelIdx}`} className="bg-white animate-pulse print:hidden">
+                    <td colSpan={31} className="border border-slate-200 p-2.5">
+                      <div className="flex items-center gap-3">
+                        <div className="h-3.5 w-8 bg-slate-200 rounded" />
+                        <div className="h-3.5 w-24 bg-slate-200 rounded" />
+                        <div className="h-3.5 w-44 bg-slate-200 rounded" />
+                        <div className="h-3.5 flex-1 bg-slate-100 rounded" />
+                        <div className="h-3.5 w-28 bg-slate-200 rounded" />
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              ) : filteredRows.length === 0 ? (
                 <tr>
-                  <td colSpan={30} className="text-center py-10 px-4 bg-slate-50/60 print:py-6">
+                  <td colSpan={31} className="text-center py-10 px-4 bg-slate-50/60 print:py-6">
                     {rawRows.length === 0 ? (
                       <div className="max-w-md mx-auto space-y-3 print:space-y-1">
                         <div className="w-12 h-12 mx-auto rounded-2xl bg-sky-100 flex items-center justify-center text-[#19588f] print:hidden">
@@ -642,10 +853,10 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
                         </div>
                         <div>
                           <h3 className="text-sm font-bold text-slate-900 print:text-xs">
-                            Belum Ada Logbook Pasien yang Diinputkan
+                            Belum Ada Input Logbook Pasien pada Shift Ini
                           </h3>
                           <p className="text-xs text-slate-500 mt-1 print:text-[8px]">
-                            Tabel Laporan Pasien otomatis menyesuaikan data yang diinputkan perawat pada <strong>Shift {selectedShift}</strong>, tanggal <strong>{activeDateFormatted}</strong>.
+                            Begitu perawat pelaksana menginput pasien pada <strong>Shift {selectedShift}</strong> ({displayDateLabel}), seluruh baris akan langsung tampil secara real-time di tabel ini tanpa menunggu persetujuan verifikasi.
                           </p>
                         </div>
                         <div className="flex flex-wrap items-center justify-center gap-2 pt-1 print:hidden">
@@ -653,7 +864,7 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
                             <button
                               type="button"
                               onClick={onNavigateToLogbook}
-                              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#19588f] hover:bg-[#154673] text-white text-xs font-bold transition-all shadow-xs cursor-pointer"
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#19588f] hover:bg-[#154673] text-white text-xs font-bold transition-all shadow-xs cursor-pointer whitespace-nowrap shrink-0"
                             >
                               <UserPlus className="w-3.5 h-3.5" />
                               <span>Input Logbook Pasien Sekarang</span>
@@ -664,13 +875,14 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
                     ) : (
                       <div className="max-w-md mx-auto space-y-2">
                         <p className="text-xs text-slate-600 font-semibold">
-                          Tidak ada data pasien yang sesuai dengan filter pencarian &ldquo;{searchQuery}&rdquo;.
+                          Tidak ada baris pasien yang sesuai dengan kriteria filter aktif.
                         </p>
                         <button
                           type="button"
                           onClick={() => {
                             setSearchQuery('');
                             setCategoryFilter('all');
+                            setStatusFilter('all');
                           }}
                           className="text-xs font-bold text-[#19588f] hover:underline cursor-pointer"
                         >
@@ -687,6 +899,15 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
                   const isHepC = row.ruangKategori.toLowerCase().includes('hep c');
                   const isRanap = row.statusRawat === 'Rawat Inap';
 
+                  const verifTextClass =
+                    row.statusVerifikasi === 'verified_karu'
+                      ? 'text-emerald-800 font-bold'
+                      : row.statusVerifikasi === 'verified_pj'
+                      ? 'text-blue-800 font-bold'
+                      : row.statusVerifikasi === 'submitted'
+                      ? 'text-amber-800 font-semibold'
+                      : 'text-slate-600 font-medium';
+
                   return (
                     <tr
                       key={row.id || idx}
@@ -694,134 +915,85 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
                         isEven ? 'bg-slate-50/70' : 'bg-white'
                       } ${isHepB ? 'bg-amber-50/40' : ''} ${isHepC ? 'bg-orange-50/40' : ''}`}
                     >
-                      {/* NO */}
                       <td className="border border-slate-300 print:border-black p-1 text-center font-bold text-slate-700">
                         {row.no}
                       </td>
-
-                      {/* NO RM */}
                       <td className="border border-slate-300 print:border-black p-1 font-semibold text-slate-900 text-center whitespace-nowrap">
                         {row.noRm}
                       </td>
-
-                      {/* NAMA LENGKAP PASIEN */}
                       <td className="border border-slate-300 print:border-black p-1 font-bold text-slate-950 whitespace-nowrap">
                         {row.namaPasien}
                       </td>
-
-                      {/* STATUS RAWAT */}
                       <td className="border border-slate-300 print:border-black p-1 text-center whitespace-nowrap">
-                        <span
-                          className={
-                            isRanap
-                              ? 'text-purple-700 font-bold'
-                              : 'text-slate-700'
-                          }
-                        >
+                        <span className={isRanap ? 'text-purple-700 font-bold' : 'text-slate-700'}>
                           {row.statusRawat}
                         </span>
                       </td>
-
-                      {/* RUANG / KATEGORI */}
                       <td className="border border-slate-300 print:border-black p-1 text-center whitespace-nowrap">
                         <span
                           className={
                             isHepB
-                              ? 'text-amber-800 font-bold bg-amber-100/70 px-1 py-0.5 rounded print:bg-transparent'
+                              ? 'text-amber-800 font-bold'
                               : isHepC
-                              ? 'text-orange-800 font-bold bg-orange-100/70 px-1 py-0.5 rounded print:bg-transparent'
+                              ? 'text-orange-800 font-bold'
                               : 'text-slate-700'
                           }
                         >
                           {row.ruangKategori}
                         </span>
                       </td>
-
-                      {/* NO. BED / MESIN */}
                       <td className="border border-slate-300 print:border-black p-1 text-center font-semibold text-slate-900 whitespace-nowrap">
                         {row.noBedMesin}
                       </td>
-
-                      {/* AKSES VASKULAR */}
                       <td className="border border-slate-300 print:border-black p-1 whitespace-nowrap">
                         {row.aksesVaskular}
                       </td>
-
-                      {/* WAKTU MULAI */}
                       <td className="border border-slate-300 print:border-black p-1 text-center font-mono">
                         {row.waktuMulai}
                       </td>
-
-                      {/* WAKTU SELESAI */}
                       <td className="border border-slate-300 print:border-black p-1 text-center font-mono">
                         {row.waktuSelesai}
                       </td>
-
-                      {/* DURASI (JAM) */}
                       <td className="border border-slate-300 print:border-black p-1 text-center font-bold">
-                        {row.durasiJam.toFixed(1).replace('.', ',')}
+                        {Number(row.durasiJam || 0).toFixed(1).replace('.', ',')}
                       </td>
-
-                      {/* BB KERING */}
                       <td className="border border-slate-300 print:border-black p-1 text-right">
-                        {row.bbKering.toFixed(1).replace('.', ',')}
+                        {Number(row.bbKering || 0).toFixed(1).replace('.', ',')}
                       </td>
-
-                      {/* BB PRE HD */}
                       <td className="border border-slate-300 print:border-black p-1 text-right font-semibold">
-                        {row.bbPreHd.toFixed(1).replace('.', ',')}
+                        {Number(row.bbPreHd || 0).toFixed(1).replace('.', ',')}
                       </td>
-
-                      {/* BB POST HD */}
                       <td className="border border-slate-300 print:border-black p-1 text-right font-semibold">
-                        {row.bbPostHd.toFixed(1).replace('.', ',')}
+                        {Number(row.bbPostHd || 0).toFixed(1).replace('.', ',')}
                       </td>
-
-                      {/* QB */}
                       <td className="border border-slate-300 print:border-black p-1 text-center font-bold text-[#19588f]">
                         {row.qb}
                       </td>
-
-                      {/* QD */}
                       <td className="border border-slate-300 print:border-black p-1 text-center text-slate-600">
                         {row.qd}
                       </td>
-
-                      {/* TARGET UF */}
                       <td className="border border-slate-300 print:border-black p-1 text-right font-semibold">
-                        {row.targetUf.toLocaleString('id-ID')}
+                        {Number(row.targetUf || 0).toLocaleString('id-ID')}
                       </td>
-
-                      {/* KT/V */}
                       <td className="border border-slate-300 print:border-black p-1 text-center font-bold text-emerald-800">
-                        {row.ktV.toFixed(2).replace('.', ',')}
+                        {Number(row.ktV || 0).toFixed(2).replace('.', ',')}
                       </td>
-
-                      {/* CAPAIAN UF */}
                       <td className="border border-slate-300 print:border-black p-1 text-right font-bold text-[#19588f]">
-                        {row.capaianUf.toLocaleString('id-ID')}
+                        {Number(row.capaianUf || 0).toLocaleString('id-ID')}
                       </td>
-
-                      {/* TD PRE */}
                       <td className="border border-slate-300 print:border-black p-1 text-center font-semibold whitespace-nowrap">
                         {row.tdPre}
                       </td>
-
-                      {/* TD POST */}
                       <td className="border border-slate-300 print:border-black p-1 text-center font-semibold whitespace-nowrap">
                         {row.tdPost}
                       </td>
-
-                      {/* DIALISER */}
                       <td className="border border-slate-300 print:border-black p-1 whitespace-nowrap">
                         {row.dialiser}
                       </td>
-
-                      {/* HEPARINISASI */}
                       <td className="border border-slate-300 print:border-black p-1 whitespace-nowrap">
                         <span
                           className={
-                            row.heparinisasi.toLowerCase().includes('free')
+                            (row.heparinisasi || '').toLowerCase().includes('free')
                               ? 'text-red-700 font-bold'
                               : 'text-slate-800'
                           }
@@ -829,62 +1001,51 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
                           {row.heparinisasi}
                         </span>
                       </td>
-
-                      {/* KOMPLIKASI INTRA-HD */}
                       <td className="border border-slate-300 print:border-black p-1">
                         <span
                           className={
-                            row.komplikasiIntraHd !== 'Tidak ada'
-                              ? 'text-amber-900 font-bold bg-amber-100/70 px-1 py-0.5 rounded block print:bg-transparent'
+                            row.komplikasiIntraHd && row.komplikasiIntraHd !== 'Tidak ada'
+                              ? 'text-amber-900 font-bold'
                               : 'text-slate-600'
                           }
                         >
-                          {row.komplikasiIntraHd}
+                          {row.komplikasiIntraHd || 'Tidak ada'}
                         </span>
                       </td>
-
-                      {/* TINDAKAN & ADVIS MEDIS DPJP */}
                       <td className="border border-slate-300 print:border-black p-1 text-[8.5px] sm:text-[9.5px] print:text-[7.5px] leading-snug">
-                        {(!row.tindakanAdvisDpjp ||
+                        {!row.tindakanAdvisDpjp ||
                         row.tindakanAdvisDpjp.trim() === '' ||
                         row.tindakanAdvisDpjp === '-' ||
                         row.tindakanAdvisDpjp.toLowerCase() === 'tidak ada' ||
                         row.komplikasiIntraHd === 'Tidak ada' ||
-                        row.komplikasiIntraHd.toLowerCase() === 'tidak ada') ? (
+                        (row.komplikasiIntraHd || '').toLowerCase() === 'tidak ada' ? (
                           <span className="text-slate-500 font-medium">Tidak ada</span>
                         ) : (
                           <span>{row.tindakanAdvisDpjp}</span>
                         )}
                       </td>
-
-                      {/* STATUS MESIN */}
                       <td className="border border-slate-300 print:border-black p-1 text-center whitespace-nowrap text-emerald-800 font-bold">
                         {row.statusMesin}
                       </td>
-
-                      {/* METODE DISINFEKSI */}
                       <td className="border border-slate-300 print:border-black p-1 text-center whitespace-nowrap">
                         {row.metodeDisinfeksi}
                       </td>
-
-                      {/* KET. TEKNIS */}
                       <td className="border border-slate-300 print:border-black p-1 text-center whitespace-nowrap">
                         {row.ketTeknis}
                       </td>
-
-                      {/* JAM CEK RO */}
                       <td className="border border-slate-300 print:border-black p-1 text-center font-mono">
                         {row.jamCekRo}
                       </td>
-
-                      {/* KONDISI AIR RO */}
                       <td className="border border-slate-300 print:border-black p-1 text-center whitespace-nowrap text-emerald-800 font-bold">
                         {row.kondisiAirRo}
                       </td>
-
-                      {/* PERAWAT PELAKSANA */}
                       <td className="border border-slate-300 print:border-black p-1 whitespace-nowrap font-semibold text-slate-900">
                         {row.perawatPelaksana}
+                      </td>
+                      <td className="border border-slate-300 print:border-black p-1 text-center whitespace-nowrap">
+                        <span className={verifTextClass}>
+                          {formatVerificationStatusLabel(row.statusVerifikasi)}
+                        </span>
                       </td>
                     </tr>
                   );
@@ -894,62 +1055,45 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
 
             {/* SUMMARY FOOTER ROW */}
             <tfoot>
-              <tr className="bg-[#1f4e79] text-white font-bold text-center border-t-2 border-slate-900 print:bg-slate-300 print:text-black">
+              <tr className="bg-[#1f4e79] text-white font-bold text-center border-t-2 border-slate-900 print:bg-slate-300 print:text-black tabular-nums">
                 <td
                   colSpan={9}
                   className="border border-slate-300 print:border-black p-1.5 text-center font-black tracking-wide uppercase"
                 >
-                  TOTAL &amp; RATA-RATA ({summary.totalPasien} PASIEN)
+                  TOTAL &amp; RATA-RATA ({summary.totalPasien} PASIEN SHIFT {selectedShift.toUpperCase()})
                 </td>
-
-                {/* Rata-rata Durasi (Jam) */}
                 <td className="border border-slate-300 print:border-black p-1 text-center font-black">
                   {summary.rataDurasiJam.toFixed(1).replace('.', ',')}
                 </td>
-
-                {/* Rata-rata BB Kering */}
                 <td className="border border-slate-300 print:border-black p-1 text-right font-black">
                   {summary.rataBbKering.toFixed(1).replace('.', ',')}
                 </td>
-
-                {/* Rata-rata BB Pre HD */}
                 <td className="border border-slate-300 print:border-black p-1 text-right font-black">
                   {summary.rataBbPreHd.toFixed(1).replace('.', ',')}
                 </td>
-
-                {/* Rata-rata BB Post HD */}
                 <td className="border border-slate-300 print:border-black p-1 text-right font-black">
                   {summary.rataBbPostHd.toFixed(1).replace('.', ',')}
                 </td>
-
-                {/* Rata-rata QB */}
                 <td className="border border-slate-300 print:border-black p-1 text-center font-black">
                   {summary.rataQb}
                 </td>
-
-                {/* Rata-rata QD */}
                 <td className="border border-slate-300 print:border-black p-1 text-center font-black">
                   {summary.rataQd}
                 </td>
-
-                {/* Total Target UF */}
                 <td className="border border-slate-300 print:border-black p-1 text-right font-black">
                   {summary.totalTargetUf.toLocaleString('id-ID')}
                 </td>
-
-                {/* Rata-rata Kt/V */}
                 <td className="border border-slate-300 print:border-black p-1 text-center font-black">
                   {summary.rataKtV.toFixed(2).replace('.', ',')}
                 </td>
-
-                {/* Total Capaian UF */}
                 <td className="border border-slate-300 print:border-black p-1 text-right font-black">
                   {summary.totalCapaianUf.toLocaleString('id-ID')}
                 </td>
-
-                {/* Remaining columns */}
-                <td colSpan={11} className="border border-slate-300 print:border-black p-1 text-center text-blue-100 print:text-black italic">
-                  - Sesi Asuhan Hemodialisis Terstandar KARS &amp; PERNEFRI -
+                <td
+                  colSpan={13}
+                  className="border border-slate-300 print:border-black p-1 text-center text-blue-100 print:text-black italic"
+                >
+                  Real-time Seluruh Input Shift · Draft: {statusCounts.draft} · Diajukan: {statusCounts.submitted} · Verified PJ: {statusCounts.verifiedPj} · Verified Ka. Ruang: {statusCounts.verifiedKaru}
                 </td>
               </tr>
             </tfoot>
@@ -963,7 +1107,7 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
               <p className="text-slate-600 print:text-black">Mengetahui,</p>
               <p className="font-bold text-slate-800 print:text-black uppercase">Penanggung Jawab Shift</p>
               <div className="h-14 sm:h-16 flex items-end justify-center">
-                <span className="text-[10px] text-emerald-800 font-mono bg-emerald-50 print:bg-transparent px-2 py-0.5 rounded border border-emerald-200 print:border-none">
+                <span className="text-[10px] text-emerald-800 font-mono">
                   ✓ Terverifikasi Digital
                 </span>
               </div>
@@ -979,7 +1123,7 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
               <p className="text-slate-600 print:text-black">Menyetujui,</p>
               <p className="font-bold text-slate-800 print:text-black uppercase">Dokter Jaga Ruangan</p>
               <div className="h-14 sm:h-16 flex items-end justify-center">
-                <span className="text-[10px] text-blue-800 font-mono bg-blue-50 print:bg-transparent px-2 py-0.5 rounded border border-blue-200 print:border-none">
+                <span className="text-[10px] text-blue-800 font-mono">
                   ✓ Pemeriksaan Medis Terkonfirmasi
                 </span>
               </div>
@@ -995,7 +1139,7 @@ export const LaporanPasienView: React.FC<LaporanPasienViewProps> = ({
               <p className="text-slate-600 print:text-black">Mengesahkan,</p>
               <p className="font-bold text-slate-800 print:text-black uppercase">Kepala Ruang</p>
               <div className="h-14 sm:h-16 flex items-end justify-center">
-                <span className="text-[10px] text-emerald-800 font-mono bg-emerald-50 print:bg-transparent px-2 py-0.5 rounded border border-emerald-200 print:border-none">
+                <span className="text-[10px] text-emerald-800 font-mono">
                   ✓ Disahkan Kepala Ruang
                 </span>
               </div>

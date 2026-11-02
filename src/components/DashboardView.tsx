@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Calendar, RotateCcw, UserCheck, Users } from 'lucide-react';
 import {
   MasterNurse,
@@ -72,11 +72,24 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [selectedMonth, setSelectedMonth] = useState<number>(() => runningDateParsed.month);
   const [selectedYear, setSelectedYear] = useState<number>(() => runningDateParsed.year);
   const [hoveredMonth, setHoveredMonth] = useState<number | null>(null);
+  const [syncTick, setSyncTick] = useState<number>(0);
 
-  React.useEffect(() => {
+  useEffect(() => {
     setSelectedMonth(runningDateParsed.month);
     setSelectedYear(runningDateParsed.year);
   }, [runningDateParsed.month, runningDateParsed.year]);
+
+  useEffect(() => {
+    const handleUpdate = () => setSyncTick((t) => t + 1);
+    window.addEventListener('logbook_records_updated', handleUpdate);
+    window.addEventListener('verification_registry_updated', handleUpdate);
+    window.addEventListener('storage', handleUpdate);
+    return () => {
+      window.removeEventListener('logbook_records_updated', handleUpdate);
+      window.removeEventListener('verification_registry_updated', handleUpdate);
+      window.removeEventListener('storage', handleUpdate);
+    };
+  }, []);
 
   // Resolve active logged-in staff identity
   const currentStaff = useMemo(() => {
@@ -119,19 +132,18 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     };
   }, [loggedInUser, masterNurses, shiftInfo, userRole]);
 
-  const analytics = useMemo(
-    () =>
-      buildDashboardAnalytics({
-        currentStaffName: currentStaff.name,
-        currentStaffRole: userRole,
-        masterNurses,
-        sessions,
-        shiftInfo,
-        selectedMonth,
-        selectedYear
-      }),
-    [currentStaff.name, userRole, masterNurses, sessions, shiftInfo, selectedMonth, selectedYear]
-  );
+  const analytics = useMemo(() => {
+    void syncTick;
+    return buildDashboardAnalytics({
+      currentStaffName: currentStaff.name,
+      currentStaffRole: userRole,
+      masterNurses,
+      sessions,
+      shiftInfo,
+      selectedMonth,
+      selectedYear
+    });
+  }, [currentStaff.name, userRole, masterNurses, sessions, shiftInfo, selectedMonth, selectedYear, syncTick]);
 
   const availableYears = useMemo(() => {
     const baseYear = runningDateParsed.year;

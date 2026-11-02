@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import {
   ShiftInfo,
   AggregatedCensus,
@@ -18,12 +18,13 @@ import {
 } from '../types/dialysis.ts';
 import { OfficialReportPrintable } from './OfficialReportPrintable.tsx';
 import { LoginUserData } from './LoginPage.tsx';
-import { generateAutoSbar } from '../utils/hdCalculator.ts';
 import {
   extractActiveDayName,
   formatIsoDateToIndonesianFull,
   formatShortIndonesianTimestampWib,
-  getCurrentIsoDateWib
+  getCurrentIsoDateWib,
+  indonesianDateLabelToIso,
+  normalizeIndonesianDateLabel
 } from '../utils/dateHelpers.ts';
 import { printDocumentWithOrientation, downloadElementAsPdf } from '../utils/printHelpers.ts';
 import {
@@ -41,10 +42,13 @@ import {
   subscribeToShiftReport,
   type NurseLogbookCloudData
 } from '../services/firebase.ts';
+import { initialMachineOverview } from '../data/mockShiftData.ts';
 import {
-  initialOperationalItems,
-  initialMachineOverview
-} from '../data/mockShiftData.ts';
+  pasienLogbookService,
+  buildKarsShiftSummaryFromVerifiedRows,
+  formatSbarHandoverText,
+  type LaporanPasienRow
+} from '../data/laporanPasienData.ts';
 import {
   FileText,
   Printer,
@@ -67,7 +71,11 @@ import {
   ClipboardCheck,
   Calendar,
   AlertCircle,
-  FileSpreadsheet
+  FileSpreadsheet,
+  Loader2,
+  ShieldCheck,
+  Copy,
+  Check
 } from 'lucide-react';
 import { exportMasterHemodialisaWorkbook } from '../utils/exportMasterSpreadsheet.ts';
 
@@ -116,7 +124,6 @@ const STORAGE_KEYS = {
 export const LapHarianView: React.FC<LapHarianViewProps> = ({
   shiftInfo,
   setShiftInfo,
-  census,
   machineOverview,
   setMachineOverview,
   clinicalIndicators,
@@ -142,6 +149,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
   const isSupervisor = userRole === 'pj_shift' || userRole === 'kepala_ruangan';
   const [activeSubTab, setActiveSubTab] = useState<LapHarianSubTab>('preview_full');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [copiedSbar, setCopiedSbar] = useState<boolean>(false);
 
   useEffect(() => {
     if (isSupervisor) {
@@ -151,8 +159,9 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
 
   const activeDay = extractActiveDayName(shiftInfo.date) as HdTreatmentDay;
   const activeShift: 'Pagi' | 'Siang' = shiftInfo.shift === 'Siang' ? 'Siang' : 'Pagi';
+  const activeDateIso = indonesianDateLabelToIso(normalizeIndonesianDateLabel(shiftInfo.date));
 
-  // Live verification registry entries & logbook shift doctors synced across all accounts & Cloud Firestore
+  // Live verification registry entries & logbook shift doctors for schedule signatory metadata
   const [registryEntries, setRegistryEntries] = useState<LogbookVerificationRegistryEntry[]>(() =>
     getVerificationRegistry(masterNurses)
   );
@@ -161,23 +170,25 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
   useEffect(() => {
     const refreshRegistry = () => {
       setRegistryEntries(getVerificationRegistry(masterNurses));
+      setLogbookDoctorSyncTick((t) => t + 1);
     };
     const refreshDoctors = () => {
       setLogbookDoctorSyncTick((t) => t + 1);
     };
     refreshRegistry();
+    window.addEventListener('logbook_records_updated', refreshRegistry);
     window.addEventListener('verification_registry_updated', refreshRegistry);
     window.addEventListener('logbook_shift_doctors_updated', refreshDoctors);
     window.addEventListener('storage', refreshDoctors);
     return () => {
+      window.removeEventListener('logbook_records_updated', refreshRegistry);
       window.removeEventListener('verification_registry_updated', refreshRegistry);
       window.removeEventListener('logbook_shift_doctors_updated', refreshDoctors);
       window.removeEventListener('storage', refreshDoctors);
     };
   }, [masterNurses, sessions]);
 
-  // Aggregate all verified logbooks across all accounts (Perawat Pelaksana, PJ Shift, Kepala Ruang)
-  // within the active date & shift
+  // Schedule & signatory metadata helper (PJ Shift, DPJP, Dokter Jaga, Kepala Ruang)
   const shiftSummary = useMemo(() => {
     void logbookDoctorSyncTick;
     return aggregateShiftVerifiedLogbooks({
@@ -207,44 +218,93 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
     loggedInUser?.name
   ]);
 
-  const shiftScopeKey = `${shiftSummary.activeDateIso}_${activeShift}`;
+  const shiftScopeKey = `${activeDateIso}_${activeShift}`;
 
-  // Effective ShiftInfo with Section A auto-computed values for display & printable sheet
-  const effectiveShiftInfo = useMemo<ShiftInfo>(
-    () => ({
-      ...shiftInfo,
-      date: shiftSummary.activeDateFormatted,
-      shift: activeShift,
-      shiftHours: shiftSummary.shiftHours,
-      pjShift: shiftSummary.pjShiftName || shiftInfo.pjShift,
-      pjShiftBerikutnya:
-        shiftSummary.pjShiftBerikutnyaName ||
-        shiftInfo.pjShiftBerikutnya ||
-        '',
-      kepalaRuangan: shiftSummary.kepalaRuanganName || DEFAULT_KEPALA_RUANGAN_NAME,
-      dokterDpjp: shiftSummary.dokterDpjpName,
-      dokterJaga: shiftSummary.dokterJagaName,
-      totalPerawatDinas: shiftSummary.jumlahPerawatDinas,
-      detailPerawat: shiftSummary.jumlahPerawatDinasLabel,
-      perawatRatio: shiftSummary.rasioPerawatPasien
-    }),
-    [shiftInfo, shiftSummary, activeShift]
+  // =========================================================================
+  // CLOUD FIRESTORE FETCH: pasienLogbookService.getVerifiedReportsByShift(tanggal, shift)
+  // Hanya menarik sesi pasien dengan status minimal 'verified_pj' atau 'verified_karu'
+  // =========================================================================
+  const [verifiedShiftRows, setVerifiedShiftRows] = useState<LaporanPasienRow[]>([]);
+  const [isLoadingCloudReport, setIsLoadingCloudReport] = useState<boolean>(true);
+  const [cloudReportError, setCloudReportError] = useState<string | null>(null);
+
+  const fetchVerifiedShiftReports = useCallback(
+    async (tanggalIso: string, shiftName: 'Pagi' | 'Siang') => {
+      setIsLoadingCloudReport(true);
+      setCloudReportError(null);
+      try {
+        const rows = await pasienLogbookService.getVerifiedReportsByShift(tanggalIso, shiftName);
+        const strictlyVerified = rows.filter(
+          (r) => r.statusVerifikasi === 'verified_pj' || r.statusVerifikasi === 'verified_karu'
+        );
+        setVerifiedShiftRows(strictlyVerified);
+      } catch (err) {
+        console.error(
+          'Gagal mengambil rangkuman shift terverifikasi dari Cloud Firestore:',
+          err
+        );
+        setCloudReportError(
+          'Gagal memuat data sesi pasien terverifikasi (verified_pj / verified_karu) dari jaringan Cloud Firestore.'
+        );
+      } finally {
+        setIsLoadingCloudReport(false);
+      }
+    },
+    []
   );
 
-  // Track whether user manually edited census / clinical / sbar in the current date+shift scope
-  const [manualOverrideScope, setManualOverrideScope] = useState<{
-    censusScope: string | null;
-    clinicalScope: string | null;
-    sbarScope: string | null;
-    manualShiftDateIso: string | null;
-  }>({
-    censusScope: null,
-    clinicalScope: null,
-    sbarScope: null,
-    manualShiftDateIso: null
-  });
+  useEffect(() => {
+    let isMounted = true;
+    void fetchVerifiedShiftReports(activeDateIso, activeShift);
 
-  const [manualCensus, setManualCensus] = useState<AggregatedCensus>(() => shiftSummary.census);
+    const unsubVerifiedShift = pasienLogbookService.subscribeVerifiedReportsByShift(
+      activeDateIso,
+      activeShift,
+      (rows) => {
+        if (!isMounted) return;
+        const strictlyVerified = rows.filter(
+          (r) => r.statusVerifikasi === 'verified_pj' || r.statusVerifikasi === 'verified_karu'
+        );
+        setVerifiedShiftRows(strictlyVerified);
+        setIsLoadingCloudReport(false);
+      },
+      (err) => {
+        console.error(
+          'Subscription error pasienLogbookService.subscribeVerifiedReportsByShift:',
+          err
+        );
+        if (!isMounted) return;
+        setCloudReportError(
+          'Sinkronisasi real-time laporan shift terganggu. Silakan klik Sinkron Logbook untuk menyegarkan.'
+        );
+        setIsLoadingCloudReport(false);
+      }
+    );
+
+    const handleLocalVerifiedRefresh = () => {
+      void pasienLogbookService
+        .getVerifiedReportsByShift(activeDateIso, activeShift)
+        .then((rows) => {
+          if (!isMounted) return;
+          setVerifiedShiftRows(
+            rows.filter(
+              (r) => r.statusVerifikasi === 'verified_pj' || r.statusVerifikasi === 'verified_karu'
+            )
+          );
+        })
+        .catch(() => {});
+    };
+
+    window.addEventListener('logbook_sessions_updated', handleLocalVerifiedRefresh);
+    window.addEventListener('logbook_records_updated', handleLocalVerifiedRefresh);
+
+    return () => {
+      isMounted = false;
+      unsubVerifiedShift();
+      window.removeEventListener('logbook_sessions_updated', handleLocalVerifiedRefresh);
+      window.removeEventListener('logbook_records_updated', handleLocalVerifiedRefresh);
+    };
+  }, [activeDateIso, activeShift, fetchVerifiedShiftReports]);
 
   const [manualMachine, setManualMachine] = useState<MachineOverview>(() => {
     try {
@@ -258,39 +318,134 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
     return machineOverview || initialMachineOverview;
   });
 
-  const [manualClinical, setManualClinical] = useState<ClinicalIndicatorItem[]>(() =>
-    shiftSummary.clinicalIndicators.length > 0
-      ? shiftSummary.clinicalIndicators
-      : clinicalIndicators
+  // Base ShiftInfo for KARS summary generation
+  const baseShiftInfoForKars = useMemo<ShiftInfo>(
+    () => ({
+      ...shiftInfo,
+      date: shiftSummary.activeDateFormatted,
+      shift: activeShift,
+      shiftHours: shiftSummary.shiftHours,
+      pjShift: shiftSummary.pjShiftName || shiftInfo.pjShift,
+      pjShiftBerikutnya:
+        shiftSummary.pjShiftBerikutnyaName || shiftInfo.pjShiftBerikutnya || '',
+      kepalaRuangan: shiftSummary.kepalaRuanganName || DEFAULT_KEPALA_RUANGAN_NAME,
+      dokterDpjp: shiftSummary.dokterDpjpName,
+      dokterJaga: shiftSummary.dokterJagaName
+    }),
+    [shiftInfo, shiftSummary, activeShift]
   );
 
-  // Automatically keep Section B (Census), Section C (Clinical Indicators), and Section E (SBAR)
-  // synchronized with verified shift logbooks whenever verified data or shift/date changes
+  // =========================================================================
+  // KALKULASI AKREDITASI KARS (BLOK A–F) MURNI DARI 'verified_pj' & 'verified_karu'
+  // =========================================================================
+  const karsSummary = useMemo(
+    () =>
+      buildKarsShiftSummaryFromVerifiedRows({
+        verifiedRows: verifiedShiftRows,
+        tanggal: activeDateIso,
+        shift: activeShift,
+        shiftInfo: baseShiftInfoForKars,
+        baseMachineOverview: manualMachine,
+        masterNurses,
+        masterDoctors,
+        nurseSchedules,
+        doctorSchedules
+      }),
+    [
+      verifiedShiftRows,
+      activeDateIso,
+      activeShift,
+      baseShiftInfoForKars,
+      manualMachine,
+      masterNurses,
+      masterDoctors,
+      nurseSchedules,
+      doctorSchedules
+    ]
+  );
+
+  const verifiedNurseCountLabel =
+    karsSummary.jumlahPerawatTerverifikasi > 0
+      ? `${karsSummary.jumlahPerawatTerverifikasi} Orang Perawat`
+      : shiftSummary.jumlahPerawatDinasLabel;
+
+  // Effective ShiftInfo with Blok A auto-computed values for display & printable sheet
+  const effectiveShiftInfo = useMemo<ShiftInfo>(
+    () => ({
+      ...baseShiftInfoForKars,
+      totalPerawatDinas:
+        karsSummary.jumlahPerawatTerverifikasi > 0
+          ? karsSummary.jumlahPerawatTerverifikasi
+          : shiftSummary.jumlahPerawatDinas,
+      detailPerawat: verifiedNurseCountLabel,
+      perawatRatio: karsSummary.rasioPerawatPasien
+    }),
+    [baseShiftInfoForKars, karsSummary, shiftSummary.jumlahPerawatDinas, verifiedNurseCountLabel]
+  );
+
+  // Track whether user manually edited census / clinical / operational / sbar in the current date+shift scope
+  const [manualOverrideScope, setManualOverrideScope] = useState<{
+    censusScope: string | null;
+    clinicalScope: string | null;
+    operationalScope: string | null;
+    sbarScope: string | null;
+    manualShiftDateIso: string | null;
+  }>({
+    censusScope: null,
+    clinicalScope: null,
+    operationalScope: null,
+    sbarScope: null,
+    manualShiftDateIso: null
+  });
+
+  const [manualCensus, setManualCensus] = useState<AggregatedCensus>(() => karsSummary.census);
+
+  const [manualClinical, setManualClinical] = useState<ClinicalIndicatorItem[]>(() =>
+    karsSummary.clinicalIndicators.length > 0 ? karsSummary.clinicalIndicators : clinicalIndicators
+  );
+
+  // Synchronize Blok B (Sensus), Blok C (Indikator Mutu Klinis), Blok D (Checklist RO), and Blok E (SBAR)
+  // strictly with verified shift sessions ('verified_pj' | 'verified_karu')
   useEffect(() => {
     if (manualOverrideScope.censusScope !== shiftScopeKey) {
-      setManualCensus(shiftSummary.census);
+      setManualCensus(karsSummary.census);
     }
-  }, [shiftSummary.census, shiftScopeKey, manualOverrideScope.censusScope]);
+  }, [karsSummary.census, shiftScopeKey, manualOverrideScope.censusScope]);
 
   useEffect(() => {
     if (manualOverrideScope.clinicalScope !== shiftScopeKey) {
-      setManualClinical(shiftSummary.clinicalIndicators);
+      setManualClinical(karsSummary.clinicalIndicators);
     }
-  }, [shiftSummary.clinicalIndicators, shiftScopeKey, manualOverrideScope.clinicalScope]);
+  }, [karsSummary.clinicalIndicators, shiftScopeKey, manualOverrideScope.clinicalScope]);
+
+  useEffect(() => {
+    if (manualOverrideScope.operationalScope !== shiftScopeKey) {
+      setOperationalItems(karsSummary.operationalItems);
+    }
+  }, [
+    karsSummary.operationalItems,
+    shiftScopeKey,
+    manualOverrideScope.operationalScope,
+    setOperationalItems
+  ]);
 
   useEffect(() => {
     if (manualOverrideScope.sbarScope !== shiftScopeKey) {
-      setSbar(shiftSummary.autoSbar);
+      setSbar(karsSummary.autoSbar);
     }
-  }, [shiftSummary.autoSbar, shiftScopeKey, manualOverrideScope.sbarScope, setSbar]);
+  }, [karsSummary.autoSbar, shiftScopeKey, manualOverrideScope.sbarScope, setSbar]);
 
-  // Keep parent shiftInfo manpower & Logbook doctor fields aligned with shiftSummary & matrix
+  // Keep parent shiftInfo manpower & Logbook doctor fields aligned
   useEffect(() => {
     setShiftInfo((prev) => {
       const nextPjBerikutnya =
         shiftSummary.pjShiftBerikutnyaName && shiftSummary.pjShiftBerikutnyaName !== '-'
           ? shiftSummary.pjShiftBerikutnyaName
           : prev.pjShiftBerikutnya;
+      const nextNurseCount =
+        karsSummary.jumlahPerawatTerverifikasi > 0
+          ? karsSummary.jumlahPerawatTerverifikasi
+          : shiftSummary.jumlahPerawatDinas;
 
       if (
         prev.pjShift === shiftSummary.pjShiftName &&
@@ -298,9 +453,9 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
         prev.kepalaRuangan === shiftSummary.kepalaRuanganName &&
         prev.dokterDpjp === shiftSummary.dokterDpjpName &&
         prev.dokterJaga === shiftSummary.dokterJagaName &&
-        prev.totalPerawatDinas === shiftSummary.jumlahPerawatDinas &&
-        prev.detailPerawat === shiftSummary.jumlahPerawatDinasLabel &&
-        prev.perawatRatio === shiftSummary.rasioPerawatPasien &&
+        prev.totalPerawatDinas === nextNurseCount &&
+        prev.detailPerawat === verifiedNurseCountLabel &&
+        prev.perawatRatio === karsSummary.rasioPerawatPasien &&
         prev.shiftHours === shiftSummary.shiftHours
       ) {
         return prev;
@@ -313,9 +468,9 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
         kepalaRuangan: shiftSummary.kepalaRuanganName,
         dokterDpjp: shiftSummary.dokterDpjpName,
         dokterJaga: shiftSummary.dokterJagaName,
-        totalPerawatDinas: shiftSummary.jumlahPerawatDinas,
-        detailPerawat: shiftSummary.jumlahPerawatDinasLabel,
-        perawatRatio: shiftSummary.rasioPerawatPasien
+        totalPerawatDinas: nextNurseCount,
+        detailPerawat: verifiedNurseCountLabel,
+        perawatRatio: karsSummary.rasioPerawatPasien
       };
     });
   }, [
@@ -326,9 +481,10 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
     shiftSummary.dokterDpjpName,
     shiftSummary.dokterJagaName,
     shiftSummary.jumlahPerawatDinas,
-    shiftSummary.jumlahPerawatDinasLabel,
-    shiftSummary.rasioPerawatPasien,
-    shiftSummary.shiftHours
+    shiftSummary.shiftHours,
+    karsSummary.jumlahPerawatTerverifikasi,
+    karsSummary.rasioPerawatPasien,
+    verifiedNurseCountLabel
   ]);
 
   // Sync unsigned signature names with PJ Shift, PJ Shift Berikutnya, and Kepala Ruangan
@@ -362,10 +518,10 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
     shiftSummary.kepalaRuanganName
   ]);
 
-  // Real-time Cloud Firestore listener for SBAR, operational items, supporting staff & signatures
+  // Real-time Cloud Firestore listener for supporting staff & signatures
   useEffect(() => {
     const unsub = subscribeToShiftReport(
-      shiftSummary.activeDateIso,
+      activeDateIso,
       activeShift,
       (cloudReport) => {
         if (cloudReport.shiftInfo) {
@@ -380,9 +536,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                 ? cloudReport.shiftInfo.pjShiftBerikutnya
                 : prev.pjShiftBerikutnya
           }));
-        }
-        if (cloudReport.operationalItems && Array.isArray(cloudReport.operationalItems)) {
-          setOperationalItems(cloudReport.operationalItems);
         }
         if (cloudReport.signatures) {
           setSignatures((prev) => ({
@@ -399,12 +552,11 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
     );
     return () => unsub();
   }, [
-    shiftSummary.activeDateIso,
+    activeDateIso,
     activeShift,
     shiftSummary.pjShiftName,
     shiftSummary.kepalaRuanganName,
     setShiftInfo,
-    setOperationalItems,
     setSignatures
   ]);
 
@@ -438,12 +590,40 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
     setTimeout(() => setToastMessage(null), 3200);
   };
 
+  // Formatted SBAR Handover Text ready to read/copy below Blok A–F
+  const formattedSbarHandoverText = useMemo(
+    () =>
+      formatSbarHandoverText({
+        shiftInfo: effectiveShiftInfo,
+        census: manualCensus,
+        qualityMetrics: karsSummary.qualityMetrics,
+        roChecklist: karsSummary.roChecklist,
+        sbar,
+        signatures
+      }),
+    [effectiveShiftInfo, manualCensus, karsSummary.qualityMetrics, karsSummary.roChecklist, sbar, signatures]
+  );
+
+  const handleCopySbarText = async () => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(formattedSbarHandoverText);
+      }
+      setCopiedSbar(true);
+      showToast('Format teks serah terima SBAR berhasil disalin ke papan klip.');
+      setTimeout(() => setCopiedSbar(false), 2500);
+    } catch (err) {
+      console.error('Clipboard copy error:', err);
+      showToast('Gagal menyalin otomatis, silakan blok dan salin teks SBAR di bawah.');
+    }
+  };
+
   // =========================================================================
   // LOGBOOK SHIFT AUTO-SYNCHRONIZATION (FOR PJ SHIFT & KEPALA RUANGAN)
   // =========================================================================
   useEffect(() => {
     if (userRole !== 'pj_shift' && userRole !== 'kepala_ruangan') return;
-    if (manualOverrideScope.manualShiftDateIso === shiftSummary.activeDateIso) return;
+    if (manualOverrideScope.manualShiftDateIso === activeDateIso) return;
 
     let savedLastShift: string | null = null;
     try {
@@ -474,7 +654,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
   }, [
     userRole,
     shiftInfo.date,
-    shiftSummary.activeDateIso,
+    activeDateIso,
     sessions,
     registryEntries,
     activeShift,
@@ -494,7 +674,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
 
     setManualOverrideScope((prev) => ({
       ...prev,
-      manualShiftDateIso: shiftSummary.activeDateIso
+      manualShiftDateIso: activeDateIso
     }));
 
     setShiftInfo((prev) => ({
@@ -558,8 +738,8 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
     const newItem: ClinicalIndicatorItem = {
       id: newId,
       label: 'Indikator Klinis Baru',
-      capaian: '0',
-      standar: 'Standar Target',
+      capaian: '0%',
+      standar: '≥ 90%',
       analisis: 'Hasil observasi dan tindak lanjut',
       isStandardMet: true
     };
@@ -576,8 +756,8 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
 
   const handleResetClinicalToStandard = () => {
     setManualOverrideScope((prev) => ({ ...prev, clinicalScope: null }));
-    setManualClinical(shiftSummary.clinicalIndicators);
-    showToast('Indikator klinis diselaraskan ke logbook terverifikasi shift ini.');
+    setManualClinical(karsSummary.clinicalIndicators);
+    showToast('Indikator mutu klinis diselaraskan kembali ke sesi pasien terverifikasi.');
   };
 
   const handleOperationalChange = (
@@ -585,6 +765,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
     field: keyof OperationalItem,
     value: string
   ) => {
+    setManualOverrideScope((prev) => ({ ...prev, operationalScope: shiftScopeKey }));
     setOperationalItems((prev) =>
       prev.map((item) => (item.id === id ? { ...item, [field]: value } : item))
     );
@@ -599,44 +780,42 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
       hasilObservasi: 'Hasil observasi fisik / uji shift',
       statusKepatuhan: 'MEMENUHI SYARAT'
     };
+    setManualOverrideScope((prev) => ({ ...prev, operationalScope: shiftScopeKey }));
     setOperationalItems((prev) => [...prev, newItem]);
     showToast('Baris item operasional baru berhasil ditambahkan.');
   };
 
   const handleDeleteOperationalItem = (id: string) => {
+    setManualOverrideScope((prev) => ({ ...prev, operationalScope: shiftScopeKey }));
     setOperationalItems((prev) => prev.filter((item) => item.id !== id));
     showToast('Item operasional dihapus.');
   };
 
   const handleResetOperationalToStandard = () => {
-    setOperationalItems(initialOperationalItems);
-    showToast('Item operasional direset ke standar KARS.');
+    setManualOverrideScope((prev) => ({ ...prev, operationalScope: null }));
+    setOperationalItems(karsSummary.operationalItems);
+    showToast('Checklist RO & item operasional diselaraskan ke sesi pasien terverifikasi.');
   };
 
-  const handlePullBaselineFromSessions = () => {
+  const handlePullBaselineFromSessions = async () => {
+    await fetchVerifiedShiftReports(activeDateIso, activeShift);
     setRegistryEntries(getVerificationRegistry(masterNurses));
     setManualOverrideScope((prev) => ({
       ...prev,
       censusScope: null,
       clinicalScope: null,
+      operationalScope: null,
       sbarScope: null
     }));
-    setManualCensus(shiftSummary.census);
-    setManualClinical(shiftSummary.clinicalIndicators);
-    setSbar(shiftSummary.autoSbar);
     showToast(
-      `Rekap Shift ${activeShift} (${shiftSummary.activeDateFormatted}) disinkronkan dari ${shiftSummary.totalPasienDilayani} logbook terverifikasi (${shiftSummary.jumlahPerawatDinasLabel} perawat).`
+      `Rangkuman KARS Shift ${activeShift} (${shiftSummary.activeDateFormatted}) disinkronkan dari sesi berstatus verified_pj / verified_karu.`
     );
   };
 
   const handleRegenerateSbar = () => {
     setManualOverrideScope((prev) => ({ ...prev, sbarScope: null }));
-    const freshSbar =
-      shiftSummary.verifiedSessions.length > 0
-        ? generateAutoSbar(effectiveShiftInfo, manualCensus, shiftSummary.verifiedSessions)
-        : shiftSummary.autoSbar;
-    setSbar(freshSbar);
-    showToast('Narasi SBAR diperbarui dari data logbook terverifikasi shift ini.');
+    setSbar(karsSummary.autoSbar);
+    showToast('Format SBAR diperbarui dari sesi pasien terverifikasi (verified_pj / verified_karu).');
   };
 
   const handleSign = (roleKey: 'pjShift' | 'pjBerikutnya' | 'kepalaRuangan') => {
@@ -658,7 +837,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
     };
     setSignatures(nextSignatures);
 
-    saveShiftReportCloud(shiftSummary.activeDateIso, activeShift, {
+    saveShiftReportCloud(activeDateIso, activeShift, {
       shiftInfo: effectiveShiftInfo,
       sbar,
       signatures: nextSignatures,
@@ -684,7 +863,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
       }
     };
     setSignatures(nextSignatures);
-    saveShiftReportCloud(shiftSummary.activeDateIso, activeShift, {
+    saveShiftReportCloud(activeDateIso, activeShift, {
       shiftInfo: effectiveShiftInfo,
       sbar,
       signatures: nextSignatures,
@@ -704,31 +883,29 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
     } catch {
       // ignore
     }
-    saveShiftReportCloud(shiftSummary.activeDateIso, activeShift, {
+    saveShiftReportCloud(activeDateIso, activeShift, {
       shiftInfo: effectiveShiftInfo,
       sbar,
       signatures,
       operationalItems
     }).catch(() => {});
-    showToast('Laporan Harian Shift berhasil disimpan dan disinkronkan ke lembar cetak & Cloud.');
+    showToast('Laporan Harian PJ Shift berhasil disimpan dan disinkronkan ke Cloud.');
   };
 
   const [isExportingPdf, setIsExportingPdf] = useState(false);
 
-  // FUNGSI CETAK: Langsung membuka dialog cetak browser
   const handlePrint = () => {
     handleSaveAllReport();
     if (activeSubTab !== 'preview_full') {
       setActiveSubTab('preview_full');
     }
     showToast('Membuka dialog cetak Laporan PJ Shift...');
-    const docTitle = `Laporan_PJ_Shift_${activeShift}_${shiftSummary.activeDateIso}`;
+    const docTitle = `Laporan_PJ_Shift_${activeShift}_${activeDateIso}`;
     setTimeout(() => {
-      printDocumentWithOrientation(false, docTitle); // A4 Portrait
+      printDocumentWithOrientation(false, docTitle);
     }, 250);
   };
 
-  // FUNGSI SIMPAN PDF: Langsung mendownload file PDF ke komputer / HP
   const handleDownloadPdf = async () => {
     handleSaveAllReport();
     if (activeSubTab !== 'preview_full') {
@@ -736,7 +913,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
     }
     setIsExportingPdf(true);
     showToast('Memproses dan mengunduh file PDF Laporan PJ Shift...');
-    const docTitle = `Laporan_PJ_Shift_${activeShift}_${shiftSummary.activeDateIso}`;
+    const docTitle = `Laporan_PJ_Shift_${activeShift}_${activeDateIso}`;
     setTimeout(async () => {
       try {
         await downloadElementAsPdf('printable-report', {
@@ -757,6 +934,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
     exportMasterHemodialisaWorkbook({
       shiftInfo: effectiveShiftInfo,
       sessions,
+      laporanPasienRows: verifiedShiftRows.length > 0 ? verifiedShiftRows : undefined,
       operationalItems,
       sbar,
       masterNurses,
@@ -769,7 +947,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
   const activeDateFormatted = shiftSummary.activeDateFormatted;
 
   return (
-    <div className="space-y-4 sm:space-y-6">
+    <div className="space-y-4 sm:space-y-6 pb-10">
       {/* Toast Alert */}
       {toastMessage && (
         <div className="fixed bottom-6 right-6 z-50 bg-slate-900 text-white px-4 py-3 rounded-xl shadow-2xl flex items-center gap-2.5 text-xs border border-slate-700 animate-in fade-in slide-in-from-bottom-3">
@@ -779,36 +957,33 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
       )}
 
       {/* Top Banner & Title Lockup */}
-      <div className="bg-white/85 backdrop-blur-md rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-xs space-y-4 print:hidden">
+      <div className="bg-white/90 backdrop-blur-md rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-xs space-y-4 print:hidden">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div>
-            {!isSupervisor && (
-              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600 font-medium">
-                <span className="font-bold text-[#1e4b85]">Standar Akreditasi KARS &amp; PERNEFRI</span>
-                <span aria-hidden="true">·</span>
-                <span>Rekapitulasi Logbook Terverifikasi Lintas Akun</span>
-                <span aria-hidden="true">·</span>
-                <span>Unit HD RS Happy Land</span>
-              </div>
-            )}
+            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600 font-medium">
+              <span className="font-bold text-[#1e4b85]">Model Akreditasi KARS (Blok A–F)</span>
+              <span aria-hidden="true">·</span>
+              <span>Basis Data: Minimal Verified PJ Shift / Verified Ka. Ruang</span>
+              <span aria-hidden="true">·</span>
+              <span>Unit HD RS Happy Land</span>
+            </div>
             <h1 className="text-lg sm:text-xl font-extrabold text-slate-900 mt-1 uppercase tracking-tight">
-              {isSupervisor ? 'LAPORAN PJ SHIFT' : 'LAPORAN HARIAN SHIFT HEMODIALISIS'}
+              {isSupervisor ? 'LAPORAN PJ SHIFT (AKREDITASI KARS BLOK A–F)' : 'LAPORAN HARIAN SHIFT HEMODIALISIS (BLOK A–F)'}
             </h1>
-            {!isSupervisor && (
-              <p className="text-xs text-slate-600 mt-0.5 max-w-3xl">
-                Merangkum seluruh data logbook pasien yang diinputkan oleh Perawat Pelaksana, PJ Shift, dan Kepala Ruang serta telah terverifikasi pada tanggal dan shift dinas yang sama.
-              </p>
-            )}
+            <p className="text-xs text-slate-600 mt-0.5 max-w-3xl">
+              Menghitung sensus pasien, persentase indikator mutu klinis, checklist Water Treatment RO, serta format teks serah terima SBAR secara real-time hanya dari sesi pasien berstatus minimal <strong>verified_pj</strong> atau <strong>verified_karu</strong>.
+            </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2 shrink-0">
             <button
               type="button"
-              onClick={handlePullBaselineFromSessions}
-              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold border border-slate-300 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-              title="Sinkronkan ulang dari seluruh logbook terverifikasi pada shift ini"
+              onClick={() => void handlePullBaselineFromSessions()}
+              disabled={isLoadingCloudReport}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 text-xs font-bold border border-slate-300 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+              title="Tarik ulang sesi terverifikasi dari Cloud Firestore"
             >
-              <RefreshCw className="w-3.5 h-3.5 text-slate-600" />
+              <RefreshCw className={`w-3.5 h-3.5 text-slate-600 ${isLoadingCloudReport ? 'animate-spin' : ''}`} />
               <span>Sinkron Logbook</span>
             </button>
 
@@ -821,7 +996,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
               <span>Simpan Laporan</span>
             </button>
 
-            {/* Tombol Cetak Langsung */}
             <button
               type="button"
               onClick={handlePrint}
@@ -832,7 +1006,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
               <span>Cetak</span>
             </button>
 
-            {/* Tombol Simpan PDF Langsung */}
             <button
               type="button"
               onClick={handleDownloadPdf}
@@ -848,7 +1021,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
               type="button"
               onClick={handleExportMasterSpreadsheet}
               className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold transition-colors cursor-pointer shadow-xs whitespace-nowrap shrink-0"
-              title="Coba unduh 1 File Master Excel (.xlsx) yang menggabungkan Laporan Pasien, Laporan PJ Shift, dan Rekapitulasi Bulanan Semua Perawat"
+              title="Unduh 1 File Master Excel (.xlsx) yang menggabungkan Laporan Pasien, Laporan PJ Shift, dan Rekapitulasi Bulanan Semua Perawat"
             >
               <FileSpreadsheet className="w-4 h-4 shrink-0" />
               <span>Master Excel (Semua Laporan)</span>
@@ -856,8 +1029,71 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
           </div>
         </div>
 
-        {/* Summary Strip of Section A Key Shift Metrics */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 pt-3 border-t border-slate-200/80 text-xs tabular-nums">
+        {/* Summary Strip of Shift Filter + Cloud Verification Status */}
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-slate-200/80 text-xs">
+          <div className="inline-flex items-center gap-2 bg-slate-100 px-3 py-1.5 rounded-xl border border-slate-200 font-semibold text-slate-700 tabular-nums">
+            <Calendar className="w-3.5 h-3.5 text-[#1e4b85] shrink-0" />
+            <span>Filter Tanggal Laporan:</span>
+            <input
+              type="date"
+              aria-label="Pilih Tanggal Laporan Harian"
+              value={activeDateIso}
+              onChange={(e) => handleDatePickerChange(e.target.value)}
+              className="bg-transparent font-bold text-slate-900 outline-hidden cursor-pointer"
+            />
+            {isCustomDate && onResetDateToToday && (
+              <button
+                type="button"
+                onClick={onResetDateToToday}
+                className="text-[11px] font-bold text-[#1e4b85] hover:underline cursor-pointer ml-1 whitespace-nowrap shrink-0"
+              >
+                Hari Ini
+              </button>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 text-[11px] font-semibold text-slate-700 tabular-nums">
+            {isLoadingCloudReport ? (
+              <span className="inline-flex items-center gap-1.5 text-[#1e4b85] font-bold">
+                <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                <span>Menarik sesi terverifikasi dari Cloud Firestore...</span>
+              </span>
+            ) : (
+              <>
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                <span className="font-bold text-slate-900">
+                  Sesi Terverifikasi: {karsSummary.qualityMetrics.totalVerifiedSessions} Pasien
+                </span>
+                <span aria-hidden="true">·</span>
+                <span className="text-blue-800">
+                  Verified PJ: {karsSummary.qualityMetrics.verifiedPjCount}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span className="text-emerald-800">
+                  Verified Ka. Ruang: {karsSummary.qualityMetrics.verifiedKaruCount}
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+
+        {cloudReportError && (
+          <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 flex flex-wrap items-center justify-between gap-2 text-xs text-rose-900">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span className="font-semibold">{cloudReportError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => void fetchVerifiedShiftReports(activeDateIso, activeShift)}
+              className="px-3 py-1 rounded-lg bg-rose-700 hover:bg-rose-800 text-white font-bold cursor-pointer whitespace-nowrap shrink-0"
+            >
+              Coba Lagi
+            </button>
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 pt-1 text-xs tabular-nums">
           <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
             <span className="text-[11px] text-slate-500 block">Hari / Tanggal</span>
             <span className="font-bold text-slate-900 block mt-0.5 truncate" title={activeDateFormatted}>
@@ -871,46 +1107,35 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
             </span>
           </div>
           <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
-            <span className="text-[11px] text-slate-500 block">PJ Shift (Pemilik Akun)</span>
+            <span className="text-[11px] text-slate-500 block">PJ Shift</span>
             <span className="font-bold text-slate-900 block mt-0.5 truncate" title={effectiveShiftInfo.pjShift}>
               {effectiveShiftInfo.pjShift}
             </span>
           </div>
           <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
-            <span className="text-[11px] text-slate-500 block">Jumlah Perawat Dinas</span>
+            <span className="text-[11px] text-slate-500 block">Perawat Terverifikasi</span>
             <span className="font-extrabold text-slate-900 block mt-0.5">
-              {shiftSummary.jumlahPerawatDinasLabel}
+              {verifiedNurseCountLabel}
             </span>
           </div>
           <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
-            <span className="text-[11px] text-slate-500 block">Rasio Perawat &amp; Pasien</span>
-            <span className="font-extrabold text-emerald-800 block mt-0.5 truncate" title={shiftSummary.rasioPerawatPasien}>
-              {shiftSummary.rasioPerawatPasien}
+            <span className="text-[11px] text-slate-500 block">Rasio Perawat : Pasien</span>
+            <span className="font-extrabold text-emerald-800 block mt-0.5 truncate" title={karsSummary.rasioPerawatPasien}>
+              {karsSummary.rasioPerawatPasien}
             </span>
           </div>
           <div className="p-2.5 rounded-xl bg-blue-50/70 border border-blue-200">
-            <span className="text-[11px] text-blue-800 block">Total Pasien Dilayani</span>
-            <span className="font-extrabold text-blue-950 block mt-0.5 truncate" title={shiftSummary.totalPasienDilayaniLabel}>
-              {shiftSummary.totalPasienDilayani} Pasien
+            <span className="text-[11px] text-blue-800 block">Sensus Terverifikasi</span>
+            <span className="font-extrabold text-blue-950 block mt-0.5 truncate">
+              {manualCensus.totalPasienDilayani} Pasien
             </span>
           </div>
         </div>
-
-        {shiftSummary.pendingSubmissionsCount > 0 && (
-          <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-200 flex items-center justify-between gap-2 text-xs text-amber-900">
-            <div className="flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 text-amber-700 shrink-0" />
-              <span>
-                Terdapat <strong>{shiftSummary.pendingSubmissionsCount} pengajuan logbook perawat</strong> pada Shift {activeShift} ({activeDateFormatted}) yang masih menunggu pengesahan di menu <strong>Verifikasi</strong>. Data akan otomatis masuk ke Laporan Harian setelah diverifikasi.
-              </span>
-            </div>
-          </div>
-        )}
       </div>
 
       {/* Sub-Tabs Navigation for Section Selection */}
       <div
-        className={`bg-white/80 backdrop-blur-md p-1.5 rounded-2xl border border-white/80 shadow-xs flex flex-wrap items-center ${
+        className={`bg-white/85 backdrop-blur-md p-1.5 rounded-2xl border border-slate-200/80 shadow-xs flex flex-wrap items-center ${
           isSupervisor ? 'justify-end' : 'justify-between'
         } gap-2 print:hidden`}
       >
@@ -919,92 +1144,92 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
             <button
               type="button"
               onClick={() => setActiveSubTab('preview_full')}
-              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
                 activeSubTab === 'preview_full'
                   ? 'bg-[#1e4b85] text-white shadow-xs'
                   : 'text-slate-700 hover:text-slate-900 hover:bg-slate-100'
               }`}
             >
               <FileText className="w-4 h-4" />
-              Dokumen Cetak (A–F)
+              Dokumen KARS (Blok A–F)
             </button>
 
             <button
               type="button"
               onClick={() => setActiveSubTab('section_a')}
-              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
                 activeSubTab === 'section_a'
                   ? 'bg-[#1e4b85] text-white shadow-xs'
                   : 'text-slate-700 hover:text-slate-900 hover:bg-slate-100'
               }`}
             >
               <Users className="w-4 h-4" />
-              Seksi A: Ketenagaan
+              Blok A: Ketenagaan
             </button>
 
             <button
               type="button"
               onClick={() => setActiveSubTab('section_b')}
-              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
                 activeSubTab === 'section_b'
                   ? 'bg-[#1e4b85] text-white shadow-xs'
                   : 'text-slate-700 hover:text-slate-900 hover:bg-slate-100'
               }`}
             >
               <Activity className="w-4 h-4" />
-              Seksi B: Sensus &amp; Mesin
+              Blok B: Sensus &amp; Mesin
             </button>
 
             <button
               type="button"
               onClick={() => setActiveSubTab('section_c')}
-              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
                 activeSubTab === 'section_c'
                   ? 'bg-[#1e4b85] text-white shadow-xs'
                   : 'text-slate-700 hover:text-slate-900 hover:bg-slate-100'
               }`}
             >
               <Stethoscope className="w-4 h-4" />
-              Seksi C: Asuhan Klinis
+              Blok C: Mutu Klinis
             </button>
 
             <button
               type="button"
               onClick={() => setActiveSubTab('section_d')}
-              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
                 activeSubTab === 'section_d'
                   ? 'bg-[#1e4b85] text-white shadow-xs'
                   : 'text-slate-700 hover:text-slate-900 hover:bg-slate-100'
               }`}
             >
               <CheckSquare className="w-4 h-4" />
-              Seksi D: Operasional &amp; RO
+              Blok D: Checklist RO
             </button>
 
             <button
               type="button"
               onClick={() => setActiveSubTab('section_e')}
-              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
                 activeSubTab === 'section_e'
                   ? 'bg-[#1e4b85] text-white shadow-xs'
                   : 'text-slate-700 hover:text-slate-900 hover:bg-slate-100'
               }`}
             >
               <Sparkles className="w-4 h-4" />
-              Seksi E: Handover SBAR
+              Blok E: SBAR
             </button>
 
             <button
               type="button"
               onClick={() => setActiveSubTab('section_f')}
-              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+              className={`px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
                 activeSubTab === 'section_f'
                   ? 'bg-[#1e4b85] text-white shadow-xs'
                   : 'text-slate-700 hover:text-slate-900 hover:bg-slate-100'
               }`}
             >
               <ClipboardCheck className="w-4 h-4" />
-              Seksi F: Pengesahan
+              Blok F: Pengesahan
             </button>
           </div>
         )}
@@ -1016,7 +1241,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
             <input
               type="date"
               aria-label="Pilih Tanggal Laporan Harian"
-              value={shiftSummary.activeDateIso}
+              value={activeDateIso}
               onChange={(e) => handleDatePickerChange(e.target.value)}
               className="bg-white border border-slate-200 rounded-md px-2 py-0.5 text-[11px] font-bold text-slate-900 cursor-pointer"
             />
@@ -1061,29 +1286,152 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
       </div>
 
       {/* ===================================================================== */}
-      {/* 1. PREVIEW DOKUMEN CETAK LENGKAP (SEKSI A–F)                           */}
+      {/* 1. RANGKUMAN AKREDITASI KARS (BLOK A–F) + FORMAT TEKS SBAR            */}
       {/* ===================================================================== */}
       {activeSubTab === 'preview_full' ? (
-        <div className="space-y-4">
-          <div className="p-3 bg-blue-50 border border-blue-200 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-blue-900 print:hidden">
-            <div className="flex items-center gap-2">
-              <FileText className="w-4 h-4 text-blue-700 shrink-0" />
-              <span>
-                <strong>Pratinjau Lembar Cetak Resmi:</strong> Merangkum otomatis seluruh logbook terverifikasi pada <strong>Shift {activeShift} ({activeDateFormatted})</strong> ({shiftSummary.jumlahPerawatDinasLabel} Perawat Dinas · {shiftSummary.totalPasienDilayani} Pasien Dilayani · Rasio {shiftSummary.rasioPerawatPasien}).
-              </span>
+        <div className="space-y-5">
+          {/* Loading State Skeleton while pulling Cloud Firestore verified shift sessions */}
+          {isLoadingCloudReport && verifiedShiftRows.length === 0 && (
+            <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-3 animate-pulse print:hidden">
+              <div className="h-4 w-72 bg-slate-200 rounded" />
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div className="h-24 bg-slate-100 rounded-xl" />
+                <div className="h-24 bg-slate-100 rounded-xl" />
+                <div className="h-24 bg-slate-100 rounded-xl" />
+              </div>
             </div>
-            {!isSupervisor && (
-              <button
-                type="button"
-                onClick={() => setActiveSubTab('section_a')}
-                className="text-xs font-bold text-blue-700 hover:underline flex items-center gap-1 cursor-pointer shrink-0 whitespace-nowrap"
-              >
-                <Edit3 className="w-3.5 h-3.5" />
-                Detail &amp; Dokter Seksi A
-              </button>
-            )}
+          )}
+
+          {/* Rangkuman Eksekutif Model Akreditasi KARS (Blok A–F) di Layar */}
+          <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-4 shadow-xs print:hidden tabular-nums">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-200">
+              <div>
+                <h2 className="text-sm sm:text-base font-extrabold text-slate-950">
+                  Rangkuman Shift Model Akreditasi KARS (Blok A–F)
+                </h2>
+                <p className="text-xs text-slate-600 mt-0.5">
+                  Dihitung eksklusif dari <strong>{karsSummary.qualityMetrics.totalVerifiedSessions} sesi pasien</strong> berstatus minimal <strong>verified_pj</strong> ({karsSummary.qualityMetrics.verifiedPjCount}) atau <strong>verified_karu</strong> ({karsSummary.qualityMetrics.verifiedKaruCount}) pada Shift {activeShift} ({activeDateFormatted}).
+                </p>
+              </div>
+              {!isSupervisor && (
+                <button
+                  type="button"
+                  onClick={() => setActiveSubTab('section_a')}
+                  className="text-xs font-bold text-[#1e4b85] hover:underline flex items-center gap-1 cursor-pointer shrink-0 whitespace-nowrap"
+                >
+                  <Edit3 className="w-3.5 h-3.5" />
+                  <span>Sunting Manual Blok A–F</span>
+                </button>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3.5 text-xs">
+              {/* BLOK A & B: Ketenagaan + Sensus Pasien */}
+              <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 space-y-2.5">
+                <div className="font-bold text-[#1e4b85] text-xs">
+                  Blok A &amp; B · Ketenagaan &amp; Sensus Pasien
+                </div>
+                <div className="space-y-1.5 text-slate-700">
+                  <div className="flex items-center justify-between">
+                    <span>Total Sensus Terverifikasi</span>
+                    <strong className="text-slate-950 font-mono">{manualCensus.totalPasienDilayani} Pasien</strong>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Rawat Jalan / Rawat Inap</span>
+                    <strong className="text-slate-900 font-mono">
+                      {manualCensus.pasienRajal} Rajal · {manualCensus.pasienRanap} Ranap
+                    </strong>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Zonasi Infeksius</span>
+                    <strong className="text-slate-900 font-mono">
+                      Reg {manualCensus.pasienReguler} · HepB {manualCensus.pasienHepB} · HepC {manualCensus.pasienHepC}
+                    </strong>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Akses Vaskular</span>
+                    <strong className="text-slate-900 font-mono">
+                      AVF {manualCensus.aksesAvFistula} · AVG {manualCensus.aksesAvGraft} · CDL {manualCensus.aksesCdlNonTunnel + manualCensus.aksesCdlPermcath}
+                    </strong>
+                  </div>
+                </div>
+              </div>
+
+              {/* BLOK C: Persentase Indikator Mutu Klinis */}
+              <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 space-y-2.5">
+                <div className="font-bold text-[#1e4b85] text-xs">
+                  Blok C · Persentase Indikator Mutu Klinis
+                </div>
+                <div className="space-y-1.5 text-slate-700">
+                  <div className="flex items-center justify-between">
+                    <span>Capaian Target UF (&ge; 90%)</span>
+                    <strong className="text-emerald-800 font-mono">
+                      {karsSummary.qualityMetrics.ufTargetMetPct}% ({karsSummary.qualityMetrics.ufTargetMetCount}/{karsSummary.qualityMetrics.totalVerifiedSessions})
+                    </strong>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Adekuasi Dosis Kt/V (&ge; 1,20)</span>
+                    <strong className="text-emerald-800 font-mono">
+                      {karsSummary.qualityMetrics.ktvMetPct}% (Rerata {karsSummary.qualityMetrics.avgKtV})
+                    </strong>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Kepatuhan Durasi (&ge; 4,0 Jam)</span>
+                    <strong className="text-slate-900 font-mono">
+                      {karsSummary.qualityMetrics.durationMetPct}% (Rerata {karsSummary.qualityMetrics.avgDurationHours} Jam)
+                    </strong>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Bebas Komplikasi Intra-HD</span>
+                    <strong className="text-slate-900 font-mono">
+                      {karsSummary.qualityMetrics.complicationFreePct}% ({karsSummary.qualityMetrics.complicationCaseCount} Kasus)
+                    </strong>
+                  </div>
+                </div>
+              </div>
+
+              {/* BLOK D, E & F: Checklist RO, SBAR & Pengesahan */}
+              <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 space-y-2.5 md:col-span-2 xl:col-span-1">
+                <div className="font-bold text-[#1e4b85] text-xs">
+                  Blok D, E &amp; F · Checklist RO &amp; Pengesahan
+                </div>
+                <div className="space-y-1.5 text-slate-700">
+                  <div className="flex items-center justify-between">
+                    <span>Status Air RO ({karsSummary.roChecklist.primaryJamCekRo} WIB)</span>
+                    <strong className="text-emerald-800 font-mono">
+                      {karsSummary.roChecklist.roMemenuhiSyaratPct}% ({karsSummary.roChecklist.overallRoStatus})
+                    </strong>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Disinfeksi Mesin (Heat Clean)</span>
+                    <strong className="text-slate-900 font-mono">
+                      {karsSummary.roChecklist.disinfeksiCompliancePct}% ({karsSummary.roChecklist.disinfeksiHeatCleanCount}/{karsSummary.roChecklist.totalCheckedSessions})
+                    </strong>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Kesiapan Operasional Mesin</span>
+                    <strong className="text-slate-900 font-mono">
+                      {karsSummary.roChecklist.mesinSiapPakaiPct}% Siap Pakai
+                    </strong>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Pengesahan Digital (Blok F)</span>
+                    <strong className="text-slate-900">
+                      {[
+                        signatures.pjShift.signed ? 'PJ Shift' : null,
+                        signatures.pjBerikutnya.signed ? 'Penerima' : null,
+                        signatures.kepalaRuangan.signed ? 'Ka. Ruang' : null
+                      ]
+                        .filter(Boolean)
+                        .join(' · ') || 'Menunggu Tanda Tangan'}
+                    </strong>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
 
+          {/* Dokumen Resmi KARS Blok A–F (Layar & A4 Print) */}
           <OfficialReportPrintable
             shiftInfo={effectiveShiftInfo}
             census={manualCensus}
@@ -1096,9 +1444,54 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
             onDownloadPdf={handleDownloadPdf}
             onSign={handleSign}
           />
+
+          {/* FORMAT TEKS SERAH TERIMA SBAR DI BAWAH RANGKUMAN BLOK A–F */}
+          <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-3.5 shadow-xs print:hidden">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+              <div>
+                <h2 className="text-sm sm:text-base font-extrabold text-slate-950 flex items-center gap-2">
+                  <FileText className="w-4 h-4 text-[#1e4b85]" />
+                  <span>Format Teks Serah Terima Shift SBAR (Standar KARS)</span>
+                </h2>
+                <p className="text-xs text-slate-600 mt-0.5">
+                  Format teks terstruktur siap salin untuk buku operan shift / komunikasi tim keperawatan berdasarkan data sesi terverifikasi (<strong>verified_pj</strong> / <strong>verified_karu</strong>).
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleRegenerateSbar}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 text-xs font-bold transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Perbarui Teks SBAR</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleCopySbarText()}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold transition-colors cursor-pointer shadow-xs whitespace-nowrap shrink-0"
+                >
+                  {copiedSbar ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-300" />
+                      <span>Teks SBAR Tersalin</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Salin Teks SBAR</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            <pre className="w-full p-4 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-800 font-mono whitespace-pre-wrap leading-relaxed overflow-x-auto tabular-nums">
+              {formattedSbarHandoverText}
+            </pre>
+          </div>
         </div>
       ) : (
-        /* Rendered invisibly on screen, but fully available in print media so user can print from any subtab! */
         <div className="hidden print:block">
           <OfficialReportPrintable
             shiftInfo={effectiveShiftInfo}
@@ -1123,14 +1516,14 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
             <div>
               <div className="text-[11px] font-bold text-[#1e4b85] uppercase tracking-wider">
-                A. INFORMASI UMUM SHIFT &amp; KETENAGAAN
+                BLOK A · INFORMASI UMUM SHIFT &amp; KETENAGAAN
               </div>
               <h2 className="text-base font-bold text-slate-900 flex items-center gap-2 mt-0.5">
                 <Users className="w-5 h-5 text-[#1e4b85]" />
                 Informasi Umum Shift &amp; Ketenagaan Unit HD
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                Otomatis merangkum hari/tanggal aktif, pemilik akun PJ Shift, Kepala Ruangan HD, jumlah perawat yang menginputkan logbook terverifikasi, shift dinas, rasio perawat dan pasien, serta total pasien dilayani.
+                Merangkum hari/tanggal aktif, PJ Shift, Kepala Ruangan HD, jumlah perawat dengan sesi terverifikasi (verified_pj / verified_karu), rasio perawat dan pasien, serta total pasien dilayani.
               </p>
             </div>
             <button
@@ -1142,12 +1535,11 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
               className="px-4 py-2 bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-2 self-start cursor-pointer whitespace-nowrap"
             >
               <Save className="w-4 h-4" />
-              Simpan &amp; Lanjut ke Seksi B
+              Simpan &amp; Lanjut ke Blok B
             </button>
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 tabular-nums">
-            {/* Left Column: Waktu, Shift, Pejabat & Dokter */}
             <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 space-y-3.5">
               <div className="text-xs font-bold text-[#1e4b85] uppercase tracking-wider flex items-center gap-1.5">
                 <Stethoscope className="w-4 h-4" />
@@ -1155,7 +1547,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                {/* 1. Hari / Tanggal */}
                 <div>
                   <div className="flex items-center justify-between mb-1">
                     <label className="block text-[11px] font-semibold text-slate-700">
@@ -1173,11 +1564,11 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                     <div className="flex items-center gap-1.5">
                       <input
                         type="date"
-                        value={shiftSummary.activeDateIso}
+                        value={activeDateIso}
                         onChange={(e) => handleDatePickerChange(e.target.value)}
                         className="text-[11px] px-2 py-1 border border-slate-300 rounded-md bg-white text-slate-700 cursor-pointer"
                       />
-                      {shiftSummary.activeDateIso !== getCurrentIsoDateWib() && (
+                      {activeDateIso !== getCurrentIsoDateWib() && (
                         <button
                           type="button"
                           onClick={() => handleDatePickerChange(getCurrentIsoDateWib())}
@@ -1190,7 +1581,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   </div>
                 </div>
 
-                {/* 2. Shift Dinas */}
                 <div>
                   <div className="flex items-center justify-between mb-1">
                     <label className="block text-[11px] font-semibold text-slate-700">
@@ -1232,14 +1622,10 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   </div>
                 </div>
 
-                {/* 3. Penanggung Jawab (PJ) Shift */}
                 <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="block text-[11px] font-semibold text-slate-700">
-                      Penanggung Jawab (PJ) Shift
-                    </label>
-                    <span className="text-[10px] text-slate-500">Pemilik Akun</span>
-                  </div>
+                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                    Penanggung Jawab (PJ) Shift
+                  </label>
                   <input
                     type="text"
                     readOnly
@@ -1248,14 +1634,10 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   />
                 </div>
 
-                {/* 4. Kepala Ruangan HD */}
                 <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="block text-[11px] font-semibold text-slate-700">
-                      Kepala Ruangan HD
-                    </label>
-                    <span className="text-[10px] text-slate-500">Ka. Ruang Unit HD</span>
-                  </div>
+                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                    Kepala Ruangan HD
+                  </label>
                   <input
                     type="text"
                     readOnly
@@ -1264,103 +1646,75 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   />
                 </div>
 
-                {/* 5. Dokter DPJP Unit HD */}
                 <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="block text-[11px] font-semibold text-slate-700">
-                      Dokter DPJP Unit HD
-                    </label>
-                    <span className="text-[10px] text-blue-700 font-medium">Sesuai Input Logbook</span>
-                  </div>
+                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                    Dokter DPJP Unit HD
+                  </label>
                   <input
                     type="text"
                     readOnly
                     value={effectiveShiftInfo.dokterDpjp}
                     className="w-full p-2 border border-slate-300 rounded-lg bg-white font-bold text-slate-900"
-                    placeholder="Nama Dokter DPJP Unit HD"
                   />
                 </div>
 
-                {/* 6. Dokter Jaga Ruangan */}
                 <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="block text-[11px] font-semibold text-slate-700">
-                      Dokter Jaga Ruangan
-                    </label>
-                    <span className="text-[10px] text-emerald-700 font-medium">Sesuai Input Logbook</span>
-                  </div>
+                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                    Dokter Jaga Ruangan
+                  </label>
                   <input
                     type="text"
                     readOnly
                     value={effectiveShiftInfo.dokterJaga}
                     className="w-full p-2 border border-slate-300 rounded-lg bg-white font-bold text-slate-900"
-                    placeholder="Nama Dokter Umum Ruangan"
                   />
                 </div>
               </div>
             </div>
 
-            {/* Right Column: Ketenagaan Perawat Dinas, Rasio & Total Pasien Dilayani */}
             <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 space-y-3.5">
               <div className="text-xs font-bold text-[#1e4b85] uppercase tracking-wider flex items-center gap-1.5">
                 <Users className="w-4 h-4" />
-                Rekap Ketenagaan, Rasio &amp; Pasien Dilayani (Shift {activeShift})
+                Rekap Ketenagaan, Rasio &amp; Sesi Terverifikasi (Shift {activeShift})
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                {/* 7. Jumlah Perawat Dinas */}
                 <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="block text-[11px] font-semibold text-slate-700">
-                      Jumlah Perawat Dinas
-                    </label>
-                    <span className="text-[10px] text-slate-500">
-                      dari {masterNurses.length || 17} Perawat
-                    </span>
-                  </div>
+                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                    Jumlah Perawat Terverifikasi
+                  </label>
                   <input
                     type="text"
                     readOnly
-                    value={shiftSummary.jumlahPerawatDinasLabel}
+                    value={verifiedNurseCountLabel}
                     className="w-full p-2 border border-slate-300 rounded-lg bg-white font-extrabold text-slate-900"
                   />
                 </div>
 
-                {/* 8. Rasio Perawat dan Pasien */}
                 <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="block text-[11px] font-semibold text-slate-700">
-                      Rasio Perawat dan Pasien
-                    </label>
-                    <span className="text-[10px] text-slate-500">Otomatis Shift</span>
-                  </div>
+                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                    Rasio Perawat dan Pasien
+                  </label>
                   <input
                     type="text"
                     readOnly
-                    value={shiftSummary.rasioPerawatPasien}
+                    value={karsSummary.rasioPerawatPasien}
                     className="w-full p-2 border border-slate-300 rounded-lg bg-white font-extrabold text-emerald-800"
                   />
                 </div>
 
-                {/* 9. Total Pasien Dilayani */}
                 <div className="sm:col-span-2">
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="block text-[11px] font-semibold text-slate-700">
-                      Total Pasien Dilayani
-                    </label>
-                    <span className="text-[10px] text-slate-500">
-                      Logbook Pasien Terverifikasi ({activeDateFormatted} · Shift {activeShift})
-                    </span>
-                  </div>
+                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                    Total Sesi Pasien Terverifikasi (verified_pj / verified_karu)
+                  </label>
                   <input
                     type="text"
                     readOnly
-                    value={shiftSummary.totalPasienDilayaniLabel}
+                    value={`${karsSummary.qualityMetrics.totalVerifiedSessions} Pasien Terverifikasi (${karsSummary.qualityMetrics.verifiedPjCount} Verified PJ · ${karsSummary.qualityMetrics.verifiedKaruCount} Verified Ka. Ruang)`}
                     className="w-full p-2 border border-blue-300 rounded-lg bg-blue-50/50 font-extrabold text-blue-950"
                   />
                 </div>
 
-                {/* Tenaga Pendukung Dinas */}
                 <div className="sm:col-span-2">
                   <label className="block text-[11px] font-semibold text-slate-700 mb-1">
                     Tenaga Pendukung Dinas (RO / Elektromedis / HK / Admin)
@@ -1375,25 +1729,22 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                 </div>
               </div>
 
-              {/* Participating Nurses Breakdown */}
               <div className="pt-2 border-t border-slate-200/80 space-y-2">
                 <div className="flex items-center justify-between text-[11px]">
                   <span className="font-bold text-slate-700">
-                    Daftar Perawat Penginput Logbook Terverifikasi ({shiftSummary.jumlahPerawatDinasLabel})
+                    Daftar Perawat pada Sesi Terverifikasi ({karsSummary.participatingNurses.length} Perawat)
                   </span>
-                  <span className="text-slate-500">
-                    Pelaksana · PJ Shift · Kepala Ruang
-                  </span>
+                  <span className="text-slate-500">verified_pj · verified_karu</span>
                 </div>
-                {shiftSummary.participatingNurses.length === 0 ? (
+                {karsSummary.participatingNurses.length === 0 ? (
                   <div className="p-3 rounded-lg bg-white border border-slate-200 text-xs text-slate-500">
-                    Belum ada perawat dengan logbook terverifikasi pada Shift {activeShift} ({activeDateFormatted}).
+                    Belum ada sesi pasien berstatus verified_pj atau verified_karu pada Shift {activeShift} ({activeDateFormatted}).
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-40 overflow-y-auto pr-1">
-                    {shiftSummary.participatingNurses.map((nurse, idx) => (
+                    {karsSummary.participatingNurses.map((nurse, idx) => (
                       <div
-                        key={nurse.canonicalKey}
+                        key={`${nurse.name}-${idx}`}
                         className="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-white border border-slate-200 text-[11px]"
                       >
                         <div className="min-w-0 pr-2">
@@ -1401,11 +1752,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                             {idx + 1}. {nurse.name}
                           </span>
                           <span className="text-[10px] text-slate-500">
-                            {nurse.role === 'kepala_ruangan'
-                              ? 'Kepala Ruang'
-                              : nurse.role === 'pj_shift'
-                              ? 'PJ Shift'
-                              : 'Perawat Pelaksana'}
+                            PJ: {nurse.verifiedPjCount} · Ka. Ruang: {nurse.verifiedKaruCount}
                           </span>
                         </div>
                         <span className="font-bold text-[#1e4b85] shrink-0">
@@ -1425,29 +1772,28 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
       {/* 3. SEKSI B: SENSUS PASIEN, AKSES VASKULAR & UTILISASI MESIN HD         */}
       {/* ===================================================================== */}
       {activeSubTab === 'section_b' && (
-        <div className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 space-y-6 shadow-xs print:hidden">
+        <div className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 space-y-6 shadow-xs print:hidden tabular-nums">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
             <div>
               <div className="text-[11px] font-bold text-[#1e4b85] uppercase tracking-wider">
-                SEKSI B (PENGISIAN MANUAL)
+                BLOK B · SENSUS PASIEN &amp; UTILISASI MESIN HD
               </div>
               <h2 className="text-base font-bold text-slate-900 flex items-center gap-2 mt-0.5">
                 <Activity className="w-5 h-5 text-[#1e4b85]" />
                 Sensus Pasien, Akses Vaskular &amp; Utilisasi Mesin Hemodialisis
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                Seluruh kolom angka sensus dan mesin diisi secara manual. Anda dapat mengubah jumlah pasien hadir, rawat jalan/inap, akses vaskular, maupun mesin aktif.
+                Otomatis terisi dari sesi pasien berstatus minimal verified_pj / verified_karu, serta dapat disesuaikan manual bila diperlukan.
               </p>
             </div>
             <div className="flex items-center gap-2 self-start">
               <button
                 type="button"
-                onClick={handlePullBaselineFromSessions}
-                className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl border border-slate-300 flex items-center gap-1.5 cursor-pointer"
-                title="Salin hitungan otomatis sesi pasien ke form manual"
+                onClick={() => void handlePullBaselineFromSessions()}
+                className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl border border-slate-300 flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
               >
                 <RefreshCw className="w-3.5 h-3.5 text-slate-600" />
-                Salin dari Sesi Pasien
+                Sinkron Sensus Terverifikasi
               </button>
               <button
                 type="button"
@@ -1455,16 +1801,15 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   handleSaveAllReport();
                   setActiveSubTab('section_c');
                 }}
-                className="px-4 py-2 bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-2 cursor-pointer"
+                className="px-4 py-2 bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-2 cursor-pointer whitespace-nowrap"
               >
                 <Save className="w-4 h-4" />
-                Simpan &amp; Lanjut ke Seksi C
+                Simpan &amp; Lanjut ke Blok C
               </button>
             </div>
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Left Sub-Section: Sensus & Klasifikasi Pasien */}
             <div className="space-y-4">
               <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 space-y-3">
                 <div className="flex items-center justify-between">
@@ -1473,12 +1818,11 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                     Sensus &amp; Klasifikasi Pasien Shift
                   </div>
                   <span className="text-[11px] font-semibold text-slate-500">
-                    Input Manual
+                    verified_pj · verified_karu
                   </span>
                 </div>
 
                 <div className="space-y-2.5 text-xs">
-                  {/* Pasien Terjadwal */}
                   <div className="flex items-center justify-between p-2 rounded-lg bg-white border border-slate-200">
                     <div>
                       <span className="font-semibold text-slate-800 block">Pasien Terjadwal (Target Shift)</span>
@@ -1493,11 +1837,10 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                     />
                   </div>
 
-                  {/* Pasien Hadir & Selesai HD */}
                   <div className="flex items-center justify-between p-2 rounded-lg bg-white border border-slate-200">
                     <div>
                       <span className="font-semibold text-blue-900 block">Pasien Hadir &amp; Selesai HD</span>
-                      <span className="text-[10px] text-slate-400">Jumlah pasien yang tuntas menjalani hemodialisa</span>
+                      <span className="text-[10px] text-slate-400">Jumlah sesi terverifikasi tuntas menjalani HD</span>
                     </div>
                     <input
                       type="number"
@@ -1508,7 +1851,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                     />
                   </div>
 
-                  {/* Pasien HD Cito / Emergency */}
                   <div className="flex items-center justify-between p-2 rounded-lg bg-white border border-slate-200">
                     <div>
                       <span className="font-semibold text-rose-800 block">Pasien HD Cito / Emergency (ICU/IGD)</span>
@@ -1523,7 +1865,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                     />
                   </div>
 
-                  {/* Pasien Batal / Tunda */}
                   <div className="flex items-center justify-between p-2 rounded-lg bg-white border border-slate-200">
                     <div>
                       <span className="font-semibold text-slate-700 block">Pasien Batal / Tunda (Reschedule)</span>
@@ -1538,12 +1879,8 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                     />
                   </div>
 
-                  {/* Kategori Reguler */}
                   <div className="flex items-center justify-between p-2 rounded-lg bg-white border border-slate-200">
-                    <div>
-                      <span className="font-semibold text-slate-800 block">Kategori: Pasien Reguler (Non-Hepatitis)</span>
-                      <span className="text-[10px] text-slate-400">Ruangan hemodialisis reguler</span>
-                    </div>
+                    <span className="font-semibold text-slate-800">Kategori: Pasien Reguler (Non-Hepatitis)</span>
                     <input
                       type="number"
                       min={0}
@@ -1553,12 +1890,8 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                     />
                   </div>
 
-                  {/* Kategori Hep B */}
                   <div className="flex items-center justify-between p-2 rounded-lg bg-white border border-slate-200">
-                    <div>
-                      <span className="font-semibold text-amber-800 block">Kategori: Pasien Isolasi Hepatitis B</span>
-                      <span className="text-[10px] text-slate-400">Ruangan isolasi khusus Hepatitis B (HBsAg +)</span>
-                    </div>
+                    <span className="font-semibold text-amber-800">Kategori: Pasien Isolasi Hepatitis B</span>
                     <input
                       type="number"
                       min={0}
@@ -1568,12 +1901,8 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                     />
                   </div>
 
-                  {/* Kategori Hep C */}
                   <div className="flex items-center justify-between p-2 rounded-lg bg-white border border-slate-200">
-                    <div>
-                      <span className="font-semibold text-amber-800 block">Kategori: Pasien Isolasi Hepatitis C / HIV</span>
-                      <span className="text-[10px] text-slate-400">Ruangan / mesin khusus Hepatitis C / HIV</span>
-                    </div>
+                    <span className="font-semibold text-amber-800">Kategori: Pasien Isolasi Hepatitis C / HIV</span>
                     <input
                       type="number"
                       min={0}
@@ -1583,7 +1912,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                     />
                   </div>
 
-                  {/* Rawat Jalan vs Inap */}
                   <div className="grid grid-cols-2 gap-2 pt-1">
                     <div className="p-2 rounded-lg bg-white border border-slate-200">
                       <span className="font-semibold text-slate-800 block text-[11px]">Pasien Rawat Jalan (Rajal)</span>
@@ -1607,11 +1935,10 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                     </div>
                   </div>
 
-                  {/* Total Pasien Dilayani */}
                   <div className="flex items-center justify-between p-2.5 rounded-lg bg-blue-50 border border-blue-200">
                     <div>
                       <span className="font-bold text-blue-950 block">Total Pasien Dilayani Shift Ini</span>
-                      <span className="text-[10px] text-blue-700">Dapat diedit atau mengikuti Hadir + Cito</span>
+                      <span className="text-[10px] text-blue-700">Dihitung dari sesi terverifikasi shift ini</span>
                     </div>
                     <input
                       type="number"
@@ -1625,9 +1952,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
               </div>
             </div>
 
-            {/* Right Sub-Section: Mesin HD & Akses Vaskular */}
             <div className="space-y-4">
-              {/* Box 1: Kapasitas Mesin */}
               <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="text-xs font-bold text-[#1e4b85] uppercase tracking-wider flex items-center gap-1.5">
@@ -1687,13 +2012,12 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                       min={0}
                       value={manualMachine.khususHepC}
                       onChange={(e) => handleMachineChange('khususHepC', parseInt(e.target.value, 10))}
-                      className="w-20 text-center font-bold text-sm p-1.5 border border-amber-300 rounded-lg bg-amber-50/40 text-amber-950 focus:bg-white"
+                      className="w-20 text-center font-bold text-sm p-1.5 border border-amber-300 rounded-lg bg-amber-50/40 text-amber-900 focus:bg-white"
                     />
                   </div>
                 </div>
               </div>
 
-              {/* Box 2: Akses Vaskular */}
               <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/70 space-y-3">
                 <div className="text-xs font-bold text-[#1e4b85] uppercase tracking-wider flex items-center gap-1.5">
                   <Layers className="w-4 h-4" />
@@ -1722,7 +2046,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                     />
                   </div>
                   <div className="p-2 rounded-lg bg-white border border-slate-200">
-                    <span className="font-semibold text-slate-800 block text-[11px]">CDL Non-Tunnel</span>
+                    <span className="font-semibold text-slate-800 block text-[11px]">CDL Non-Tunnel / Femoral</span>
                     <input
                       type="number"
                       min={0}
@@ -1749,37 +2073,36 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
       )}
 
       {/* ===================================================================== */}
-      {/* 4. SEKSI C: MONITORING ASUHAN KEPERAWATAN & PELAYANAN MEDIS SHIFT      */}
+      {/* 4. SEKSI C: PERSENTASE INDIKATOR MUTU KLINIS SHIFT                     */}
       {/* ===================================================================== */}
       {activeSubTab === 'section_c' && (
-        <div className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 space-y-6 shadow-xs print:hidden">
+        <div className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 space-y-6 shadow-xs print:hidden tabular-nums">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
             <div>
               <div className="text-[11px] font-bold text-[#1e4b85] uppercase tracking-wider">
-                SEKSI C (PENGISIAN MANUAL)
+                BLOK C · INDIKATOR MUTU KLINIS AKREDITASI KARS
               </div>
               <h2 className="text-base font-bold text-slate-900 flex items-center gap-2 mt-0.5">
                 <Stethoscope className="w-5 h-5 text-[#1e4b85]" />
-                Monitoring Asuhan Keperawatan &amp; Pelayanan Medis Shift
+                Persentase Indikator Mutu Klinis &amp; Pelayanan Medis Shift
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                Input manual indikator asuhan klinis (capaian UF, insiden hipotensi, kram, clotting, alergi first-use, konsultasi DPJP). Anda dapat mengedit nilai capaian, target, analisis, atau menambah indikator baru.
+                Persentase capaian UF, adekuasi Kt/V, durasi dialisis, sesi bebas komplikasi, dan dokumentasi advis DPJP dari sesi pasien terverifikasi.
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2 self-start">
               <button
                 type="button"
                 onClick={handleResetClinicalToStandard}
-                className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl border border-slate-300 flex items-center gap-1.5 cursor-pointer"
-                title="Kembalikan ke 8 indikator standar PERNEFRI"
+                className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl border border-slate-300 flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
               >
                 <RotateCcw className="w-3.5 h-3.5 text-slate-600" />
-                Reset Standar
+                Hitung Ulang dari Sesi Terverifikasi
               </button>
               <button
                 type="button"
                 onClick={handleAddClinicalIndicator}
-                className="px-3 py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 text-xs font-bold rounded-xl border border-blue-200 flex items-center gap-1.5 cursor-pointer"
+                className="px-3 py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 text-xs font-bold rounded-xl border border-blue-200 flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
               >
                 <Plus className="w-4 h-4 text-blue-700" />
                 Tambah Indikator
@@ -1790,10 +2113,10 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   handleSaveAllReport();
                   setActiveSubTab('section_d');
                 }}
-                className="px-4 py-2 bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-2 cursor-pointer"
+                className="px-4 py-2 bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-2 cursor-pointer whitespace-nowrap"
               >
                 <Save className="w-4 h-4" />
-                Simpan &amp; Lanjut ke Seksi D
+                Simpan &amp; Lanjut ke Blok D
               </button>
             </div>
           </div>
@@ -1802,8 +2125,8 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
             <table className="w-full text-xs text-left border-collapse border border-slate-200">
               <thead>
                 <tr className="bg-[#1e4b85]/10 text-slate-900 font-bold">
-                  <th className="p-2.5 border border-slate-200 w-1/4">Indikator Asuhan Keperawatan &amp; Medis</th>
-                  <th className="p-2.5 border border-slate-200 w-1/6 text-center">Capaian Shift Ini</th>
+                  <th className="p-2.5 border border-slate-200 w-1/4">Indikator Mutu Klinis KARS</th>
+                  <th className="p-2.5 border border-slate-200 w-1/6 text-center">Capaian (%)</th>
                   <th className="p-2.5 border border-slate-200 w-1/6 text-center">Standar Target</th>
                   <th className="p-2.5 border border-slate-200">Analisis &amp; Rencana Tindak Lanjut</th>
                   <th className="p-2.5 border border-slate-200 w-12 text-center">Aksi</th>
@@ -1818,7 +2141,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                         value={item.label}
                         onChange={(e) => handleClinicalChange(item.id, 'label', e.target.value)}
                         className="w-full p-1.5 text-xs font-semibold text-slate-900 border border-slate-300 rounded bg-white"
-                        placeholder="Nama indikator klinis"
                       />
                     </td>
                     <td className="p-2 border border-slate-200 text-center">
@@ -1826,8 +2148,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                         type="text"
                         value={item.capaian}
                         onChange={(e) => handleClinicalChange(item.id, 'capaian', e.target.value)}
-                        className="w-full p-1.5 text-xs font-bold text-center text-blue-900 border border-slate-300 rounded bg-white"
-                        placeholder="e.g. 100%, 0 Kasus"
+                        className="w-full p-1.5 text-xs font-bold text-center text-blue-900 border border-slate-300 rounded bg-white font-mono"
                       />
                     </td>
                     <td className="p-2 border border-slate-200 text-center">
@@ -1835,8 +2156,7 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                         type="text"
                         value={item.standar}
                         onChange={(e) => handleClinicalChange(item.id, 'standar', e.target.value)}
-                        className="w-full p-1.5 text-xs text-center text-slate-700 border border-slate-300 rounded bg-white"
-                        placeholder="e.g. >= 85%, 0 Kasus"
+                        className="w-full p-1.5 text-xs text-center text-slate-700 border border-slate-300 rounded bg-white font-mono"
                       />
                     </td>
                     <td className="p-2 border border-slate-200">
@@ -1845,7 +2165,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                         value={item.analisis}
                         onChange={(e) => handleClinicalChange(item.id, 'analisis', e.target.value)}
                         className="w-full p-1.5 text-xs text-slate-800 border border-slate-300 rounded bg-white resize-y"
-                        placeholder="Catatan analisis klinis dan rekomendasi"
                       />
                     </td>
                     <td className="p-2 border border-slate-200 text-center align-middle">
@@ -1867,37 +2186,36 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
       )}
 
       {/* ===================================================================== */}
-      {/* 5. SEKSI D: AKUNTABILITAS NON-MEDIS, OPERASIONAL, WATER TREATMENT & K3 */}
+      {/* 5. SEKSI D: CHECKLIST WATER TREATMENT RO & OPERASIONAL                 */}
       {/* ===================================================================== */}
       {activeSubTab === 'section_d' && (
-        <div className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 space-y-6 shadow-xs print:hidden">
+        <div className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 space-y-6 shadow-xs print:hidden tabular-nums">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
             <div>
               <div className="text-[11px] font-bold text-[#1e4b85] uppercase tracking-wider">
-                SEKSI D (PENGISIAN MANUAL)
+                BLOK D · CHECKLIST WATER TREATMENT RO, DISINFEKSI &amp; PPI
               </div>
               <h2 className="text-base font-bold text-slate-900 flex items-center gap-2 mt-0.5">
                 <CheckSquare className="w-5 h-5 text-[#1e4b85]" />
-                Akuntabilitas Non-Medis, Operasional, Water Treatment &amp; K3
+                Checklist Mutu Air Reverse Osmosis (RO), Disinfeksi Mesin &amp; K3
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                Pengawasan mutu air Reverse Osmosis (TDS, kesadahan, klorin), kesiapan logistik BMHP, suhu ruangan, dan kepatuhan K3. Seluruh baris dan parameter dapat disunting bebas.
+                Dihitung otomatis dari pemeriksaan jam cek RO ({karsSummary.roChecklist.primaryJamCekRo} WIB) dan disinfeksi Heat Clean pada sesi pasien terverifikasi.
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2 self-start">
               <button
                 type="button"
                 onClick={handleResetOperationalToStandard}
-                className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl border border-slate-300 flex items-center gap-1.5 cursor-pointer"
-                title="Kembalikan ke standar mutu KARS"
+                className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl border border-slate-300 flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
               >
                 <RotateCcw className="w-3.5 h-3.5 text-slate-600" />
-                Reset Standar
+                Sinkron Checklist RO
               </button>
               <button
                 type="button"
                 onClick={handleAddOperationalItem}
-                className="px-3 py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 text-xs font-bold rounded-xl border border-blue-200 flex items-center gap-1.5 cursor-pointer"
+                className="px-3 py-2 bg-blue-50 hover:bg-blue-100 text-blue-800 text-xs font-bold rounded-xl border border-blue-200 flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
               >
                 <Plus className="w-4 h-4 text-blue-700" />
                 Tambah Item
@@ -1908,10 +2226,10 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   handleSaveAllReport();
                   setActiveSubTab('section_e');
                 }}
-                className="px-4 py-2 bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-2 cursor-pointer"
+                className="px-4 py-2 bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-2 cursor-pointer whitespace-nowrap"
               >
                 <Save className="w-4 h-4" />
-                Simpan &amp; Lanjut ke Seksi E
+                Simpan &amp; Lanjut ke Blok E
               </button>
             </div>
           </div>
@@ -1930,7 +2248,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                       value={item.item}
                       onChange={(e) => handleOperationalChange(item.id, 'item', e.target.value)}
                       className="font-bold text-xs text-slate-900 p-1 border border-slate-300 rounded bg-white w-full max-w-sm"
-                      placeholder="Nama fasilitas / sistem"
                     />
                   </div>
                   <div className="flex items-center gap-2">
@@ -1940,7 +2257,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                       value={item.statusKepatuhan}
                       onChange={(e) => handleOperationalChange(item.id, 'statusKepatuhan', e.target.value)}
                       className="text-xs font-bold px-2.5 py-1 rounded-lg border border-slate-300 bg-white text-emerald-800"
-                      placeholder="MEMENUHI SYARAT"
                     />
                     <button
                       type="button"
@@ -1963,7 +2279,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                       value={item.parameterUji}
                       onChange={(e) => handleOperationalChange(item.id, 'parameterUji', e.target.value)}
                       className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
-                      placeholder="e.g. TDS < 10 ppm, Hardness 0, Klorin Bebas < 0.1 mg/L"
                     />
                   </div>
                   <div>
@@ -1975,7 +2290,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                       value={item.hasilObservasi}
                       onChange={(e) => handleOperationalChange(item.id, 'hasilObservasi', e.target.value)}
                       className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white font-medium text-slate-900"
-                      placeholder="e.g. Air RO Tersedia, TDS 3.2 ppm, Klorin 0.01 mg/L (Normal)"
                     />
                   </div>
                 </div>
@@ -1986,32 +2300,31 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
       )}
 
       {/* ===================================================================== */}
-      {/* 6. SEKSI E: ASISTEN SERAH TERIMA SHIFT MODEL SBAR                      */}
+      {/* 6. SEKSI E: SERAH TERIMA SHIFT MODEL SBAR                              */}
       {/* ===================================================================== */}
       {activeSubTab === 'section_e' && (
         <div className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 space-y-6 shadow-xs print:hidden">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
             <div>
               <div className="text-[11px] font-bold text-[#1e4b85] uppercase tracking-wider">
-                SEKSI E (PENGISIAN MANUAL)
+                BLOK E · KOMUNIKASI EFEKTIF SERAH TERIMA SBAR
               </div>
               <h2 className="text-base font-bold text-slate-900 flex items-center gap-2 mt-0.5">
                 <Sparkles className="w-5 h-5 text-indigo-600" />
                 Serah Terima Shift Model SBAR (Situation, Background, Assessment, Recommendation)
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                Standar handover klinis KARS untuk kontinuitas asuhan antar-shift dinas. Seluruh teks narasi dapat diketik manual secara bebas.
+                Standar handover klinis KARS berdasarkan data sesi pasien berstatus minimal verified_pj / verified_karu.
               </p>
             </div>
             <div className="flex items-center gap-2 self-start">
               <button
                 type="button"
                 onClick={handleRegenerateSbar}
-                className="px-3.5 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 text-xs font-bold rounded-xl shadow-2xs flex items-center gap-2 cursor-pointer"
-                title="Perbarui draf teks otomatis dari sensus manual"
+                className="px-3.5 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 text-xs font-bold rounded-xl shadow-2xs flex items-center gap-2 cursor-pointer whitespace-nowrap"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
-                Draf dari Sensus
+                Draf dari Sesi Terverifikasi
               </button>
               <button
                 type="button"
@@ -2019,22 +2332,21 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   handleSaveAllReport();
                   setActiveSubTab('section_f');
                 }}
-                className="px-4 py-2 bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-2 cursor-pointer"
+                className="px-4 py-2 bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-2 cursor-pointer whitespace-nowrap"
               >
                 <Save className="w-4 h-4" />
-                Simpan &amp; Lanjut ke Seksi F
+                Simpan &amp; Lanjut ke Blok F
               </button>
             </div>
           </div>
 
           <div className="space-y-4">
-            {/* Situation */}
             <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/60 space-y-2">
               <div className="flex items-center justify-between">
                 <label className="text-xs font-bold text-[#1e4b85] uppercase tracking-wide">
                   1. SITUATION (S) - Situasi Shift
                 </label>
-                <span className="text-[11px] text-slate-400">Jumlah pasien selesai, mesin aktif, highlight komplikasi</span>
+                <span className="text-[11px] text-slate-400">Sensus terverifikasi &amp; kepemimpinan shift</span>
               </div>
               <textarea
                 rows={3}
@@ -2044,17 +2356,15 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   setSbar({ ...sbar, situation: e.target.value });
                 }}
                 className="w-full text-xs p-3 rounded-xl border border-slate-300 bg-white leading-relaxed"
-                placeholder="Tuliskan gambaran situasi umum shift, jumlah pasien selesai, dan kesiapan mesin..."
               />
             </div>
 
-            {/* Background */}
             <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/60 space-y-2">
               <div className="flex items-center justify-between">
                 <label className="text-xs font-bold text-[#1e4b85] uppercase tracking-wide">
                   2. BACKGROUND (B) - Riwayat Kasus Pasien Berisiko
                 </label>
-                <span className="text-[11px] text-slate-400">Data klinis pasien hipotensi, kram, under-UF, atau akses sulit</span>
+                <span className="text-[11px] text-slate-400">Distribusi akses vaskular &amp; kasus komplikasi</span>
               </div>
               <textarea
                 rows={3}
@@ -2064,17 +2374,15 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   setSbar({ ...sbar, background: e.target.value });
                 }}
                 className="w-full text-xs p-3 rounded-xl border border-slate-300 bg-white leading-relaxed"
-                placeholder="Tuliskan latar belakang pasien yang mengalami penyulit atau pemantauan khusus..."
               />
             </div>
 
-            {/* Assessment */}
             <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/60 space-y-2">
               <div className="flex items-center justify-between">
                 <label className="text-xs font-bold text-[#1e4b85] uppercase tracking-wide">
-                  3. ASSESSMENT (A) - Penilaian &amp; Evaluasi Capaian
+                  3. ASSESSMENT (A) - Penilaian Indikator Mutu &amp; RO
                 </label>
-                <span className="text-[11px] text-slate-400">Capaian UF aktual, respon hemodialisis, stabilitas hemodinamik</span>
+                <span className="text-[11px] text-slate-400">Persentase capaian UF, Kt/V, durasi, dan mutu RO</span>
               </div>
               <textarea
                 rows={3}
@@ -2084,17 +2392,15 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   setSbar({ ...sbar, assessment: e.target.value });
                 }}
                 className="w-full text-xs p-3 rounded-xl border border-slate-300 bg-white leading-relaxed"
-                placeholder="Tuliskan evaluasi capaian asuhan medis dan keperawatan pada shift ini..."
               />
             </div>
 
-            {/* Recommendation */}
             <div className="p-4 rounded-xl border border-slate-200 bg-slate-50/60 space-y-2">
               <div className="flex items-center justify-between">
                 <label className="text-xs font-bold text-[#1e4b85] uppercase tracking-wide">
                   4. RECOMMENDATION (R) - Rekomendasi Shift Berikutnya
                 </label>
-                <span className="text-[11px] text-slate-400">Poin penting persiapan priming mesin, stok dialiser, uji RO</span>
+                <span className="text-[11px] text-slate-400">Rencana tindak lanjut tim shift selanjutnya</span>
               </div>
               <textarea
                 rows={4}
@@ -2104,8 +2410,27 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   setSbar({ ...sbar, recommendation: e.target.value });
                 }}
                 className="w-full text-xs p-3 rounded-xl border border-slate-300 bg-white leading-relaxed"
-                placeholder="1. Pastikan persiapan mesin dan priming dialiser sesuai SOP.&#10;2. Pantau pasien dengan riwayat under-UF atau hipotensi pada shift sebelumnya.&#10;3. Lakukan regenerasi softener RO jika kesadahan meningkat."
               />
+            </div>
+
+            {/* Pratinjau Format Teks Serah Terima SBAR */}
+            <div className="pt-4 border-t border-slate-200 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-900">
+                  Format Teks Serah Terima SBAR (Siap Salin):
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void handleCopySbarText()}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold cursor-pointer whitespace-nowrap"
+                >
+                  {copiedSbar ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedSbar ? 'Tersalin' : 'Salin Teks SBAR'}</span>
+                </button>
+              </div>
+              <pre className="w-full p-4 rounded-xl bg-slate-50 border border-slate-200 text-xs text-slate-800 font-mono whitespace-pre-wrap leading-relaxed overflow-x-auto tabular-nums">
+                {formattedSbarHandoverText}
+              </pre>
             </div>
           </div>
         </div>
@@ -2119,14 +2444,14 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
             <div>
               <div className="text-[11px] font-bold text-[#1e4b85] uppercase tracking-wider">
-                SEKSI F (PENGISIAN MANUAL &amp; TANDA TANGAN DIGITAL)
+                BLOK F · PENGESAHAN &amp; TANDA TANGAN DIGITAL
               </div>
               <h2 className="text-base font-bold text-slate-900 flex items-center gap-2 mt-0.5">
                 <ClipboardCheck className="w-5 h-5 text-[#1e4b85]" />
                 Pengesahan &amp; Pertanggungjawaban Shift (3 Pihak)
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                Nama-nama penanggung jawab shift dapat diubah secara manual, disertai pembubuhan tanda tangan digital resmi yang tercantum pada lembar cetak PDF.
+                Pembubuhan tanda tangan digital resmi PJ Shift, Penerima Shift Berikutnya, dan Kepala Ruangan HD.
               </p>
             </div>
             <button
@@ -2135,23 +2460,22 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                 handleSaveAllReport();
                 setActiveSubTab('preview_full');
               }}
-              className="px-4 py-2 bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-2 self-start cursor-pointer"
+              className="px-4 py-2 bg-[#1e4b85] hover:bg-[#163865] text-white text-xs font-bold rounded-xl shadow-xs flex items-center gap-2 self-start cursor-pointer whitespace-nowrap"
             >
               <Save className="w-4 h-4" />
-              Simpan &amp; Lihat Lembar Cetak
+              Simpan &amp; Lihat Rangkuman KARS
             </button>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-            {/* 1. Yang Menyerahkan */}
             <div className="p-4 bg-slate-50/70 rounded-xl border border-slate-200 flex flex-col justify-between shadow-2xs space-y-4">
               <div>
                 <div className="text-[10px] font-bold text-slate-500 uppercase">1. Yang Menyerahkan</div>
                 <div className="font-bold text-[#1e4b85] mt-1 text-sm flex items-center justify-between">
                   <span>{activeShift === 'Pagi' ? 'PJ SHIFT PAGI' : 'PJ SHIFT SIANG'}</span>
                   {shiftSummary.pjShiftIsFromMatrix && (
-                    <span className="text-[9px] bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded font-semibold border border-emerald-300">
-                      ✓ Dari Matriks
+                    <span className="text-[10px] text-emerald-800 font-semibold">
+                      ✓ Dari Jadwal
                     </span>
                   )}
                 </div>
@@ -2164,11 +2488,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   value={effectiveShiftInfo.pjShift}
                   className="w-full p-2 border border-slate-300 rounded-lg bg-white font-semibold text-slate-900"
                 />
-                <p className="text-[10px] text-slate-500 mt-1">
-                  {shiftSummary.pjShiftIsFromMatrix
-                    ? 'Sesuai perawat dengan kode PJ pada matrik jadwal bulanan.'
-                    : 'Diambil dari data akun / perawat PJ Shift aktif.'}
-                </p>
               </div>
 
               <div className="pt-3 border-t border-slate-200">
@@ -2202,7 +2521,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
               </div>
             </div>
 
-            {/* 2. Yang Menerima / Menerima */}
             <div className="p-4 bg-slate-50/70 rounded-xl border border-slate-200 flex flex-col justify-between shadow-2xs space-y-4">
               <div>
                 <div className="text-[10px] font-bold text-slate-500 uppercase">
@@ -2211,8 +2529,8 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                 <div className="font-bold text-[#1e4b85] mt-1 text-sm flex items-center justify-between">
                   <span>{activeShift === 'Pagi' ? 'PJ SHIFT SIANG' : 'Perawat On-Call / Shift Berikutnya'}</span>
                   {shiftSummary.pjShiftBerikutnyaIsFromMatrix && (
-                    <span className="text-[9px] bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded font-semibold border border-emerald-300">
-                      ✓ Dari Matriks
+                    <span className="text-[10px] text-emerald-800 font-semibold">
+                      ✓ Dari Jadwal
                     </span>
                   )}
                 </div>
@@ -2224,21 +2542,8 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   value={effectiveShiftInfo.pjShiftBerikutnya}
                   onChange={(e) => setShiftInfo({ ...shiftInfo, pjShiftBerikutnya: e.target.value })}
                   className="w-full p-2 border border-slate-300 rounded-lg bg-white font-medium text-slate-900"
-                  placeholder={
-                    activeShift === 'Pagi'
-                      ? 'Nama PJ Shift Siang'
-                      : 'Nama Perawat On-Call / Penerima'
-                  }
+                  placeholder={activeShift === 'Pagi' ? 'Nama PJ Shift Siang' : 'Nama Perawat On-Call / Penerima'}
                 />
-                <p className="text-[10px] text-slate-500 mt-1">
-                  {activeShift === 'Pagi'
-                    ? shiftSummary.pjShiftBerikutnyaIsFromMatrix
-                      ? 'Otomatis terisi dari jadwal PJ Shift Siang pada matrik bulanan.'
-                      : 'Dapat diisi manual atau otomatis saat PJ Siang diinput di matriks.'
-                    : shiftSummary.pjShiftBerikutnyaIsFromMatrix
-                    ? 'Otomatis terisi dari perawat On-Call pada matrik bulanan.'
-                    : 'Dapat diisi nama perawat on-call atau shift berikutnya.'}
-                </p>
               </div>
 
               <div className="pt-3 border-t border-slate-200">
@@ -2272,7 +2577,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
               </div>
             </div>
 
-            {/* 3. Mengetahui & Menyetujui: Kepala Ruang */}
             <div className="p-4 bg-slate-50/70 rounded-xl border border-slate-200 flex flex-col justify-between shadow-2xs space-y-4">
               <div>
                 <div className="text-[10px] font-bold text-slate-500 uppercase">3. Mengetahui &amp; Menyetujui</div>
@@ -2286,9 +2590,6 @@ export const LapHarianView: React.FC<LapHarianViewProps> = ({
                   value={effectiveShiftInfo.kepalaRuangan}
                   className="w-full p-2 border border-slate-300 rounded-lg bg-white font-semibold text-slate-900"
                 />
-                <p className="text-[10px] text-slate-500 mt-1">
-                  Kepala Ruangan Hemodialisis (TWIS FERTILIANTI PW, S.Kep., Ns.).
-                </p>
               </div>
 
               <div className="pt-3 border-t border-slate-200">

@@ -7,7 +7,7 @@ import {
   SystemAccessRole
 } from '../types/dialysis.ts';
 import type { NurseLogbookCloudData } from '../services/firebase.ts';
-import { OFFICIAL_LOGBOOK_ITEMS } from '../data/officialPelaksanaLogbookData.ts';
+import { OFFICIAL_LOGBOOK_ITEMS, logbookService } from '../data/officialPelaksanaLogbookData.ts';
 import { getCurrentIndonesianFullDate, getWibDateParts, formatCurrentWibTimestamp } from './dateHelpers.ts';
 import {
   PER_PATIENT_STATUS_STORAGE_KEY,
@@ -1374,6 +1374,98 @@ export function buildStaffMonthlyRecap(params: {
       effectiveMonthSnapshots[snap.day] = snap;
     }
   });
+
+  // Integrasikan langsung dengan logbookService.getVerifiedReports() untuk bulan, tahun, & perawat terkait
+  if (
+    storedSnapshotsOverride === undefined &&
+    liveVerificationOverride === undefined &&
+    nurseName &&
+    nurseName !== '-'
+  ) {
+    const serviceVerifiedReports = logbookService.getCachedVerifiedReports({
+      bulan: month,
+      tahun: year,
+      namaPerawat: nurseName
+    });
+
+    serviceVerifiedReports.forEach((rec) => {
+      const matchIso = (rec.tanggal || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (!matchIso) return;
+      const recDay = parseInt(matchIso[3], 10);
+      if (recDay < 1 || recDay > daysInMonth) return;
+      if (effectiveMonthSnapshots[recDay]) return;
+
+      const verifBy = rec.verifikatorKaruNama || rec.verifikatorPjNama;
+      const verifRole =
+        rec.statusVerifikasi === 'verified_karu' ? 'Kepala Ruang' : 'PJ Shift';
+      if (
+        !isVerificationEligibleForStaffRole({
+          staffName: nurseName,
+          staffRole: userRole,
+          isVerified: true,
+          verifiedBy: verifBy,
+          verifiedByRole: verifRole
+        })
+      ) {
+        return;
+      }
+
+      const facMap: Record<string, boolean> =
+        rec.facilityStatuses && Object.keys(rec.facilityStatuses).length > 0
+          ? { ...rec.facilityStatuses }
+          : OFFICIAL_LOGBOOK_ITEMS.filter((it) => it.bagian === 1).reduce<Record<string, boolean>>(
+              (acc, it) => {
+                acc[it.code] = Boolean(rec.items?.find((x) => x.code === it.code)?.verified);
+                return acc;
+              },
+              {}
+            );
+
+      const patChecksList: Array<Record<string, boolean>> = [];
+      if (rec.patientStatuses && Object.keys(rec.patientStatuses).length > 0) {
+        const patKeys =
+          Array.isArray(rec.patients) && rec.patients.length > 0
+            ? rec.patients.map((p) => p.id || p.bedNumber)
+            : Object.keys(rec.patientStatuses);
+        patKeys.forEach((pk) => {
+          const map = rec.patientStatuses?.[pk];
+          if (map) {
+            patChecksList.push(map);
+          }
+        });
+      }
+
+      if (patChecksList.length === 0) {
+        const itemBoolMap = OFFICIAL_LOGBOOK_ITEMS.reduce<Record<string, boolean>>((acc, it) => {
+          const found = rec.items?.find((x) => x.code === it.code);
+          acc[it.code] = found ? Boolean(found.verified) : true;
+          return acc;
+        }, {});
+        const patCount =
+          Array.isArray(rec.patients) && rec.patients.length > 0 ? rec.patients.length : 1;
+        for (let i = 0; i < patCount; i++) {
+          patChecksList.push({ ...itemBoolMap });
+        }
+      }
+
+      const computed = computeDailySpoScoresFromVerifiedLogbook(facMap, patChecksList);
+      if (computed) {
+        effectiveMonthSnapshots[recDay] = {
+          dateKey: rec.tanggal,
+          day: recDay,
+          month,
+          year,
+          verifiedPatientCount: computed.verifiedPatientCount,
+          poin3_6MaxCount: computed.poin3_6MaxCount,
+          scores: computed.scores,
+          verifiedBy: verifBy,
+          verifiedByRole: verifRole,
+          verifiedAt: rec.verifiedKaruAt || rec.verifiedPjAt || rec.updatedAt,
+          shift: (rec.shift === 'Siang' ? 'Siang' : 'Pagi') as ShiftName
+        };
+      }
+    });
+  }
 
   const dailyScores: Record<string, (number | null)[]> = {};
   const dailyItemMaxScores: Record<string, (number | null)[]> = {};

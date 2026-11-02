@@ -13,8 +13,21 @@ import {
   resolveLogbookLockState,
   canVerifierRoleEditSubmitted,
   isSamePatientIdentity,
-  collectOccupiedLogbookAssets
+  collectOccupiedLogbookAssets,
+  convertLogbookRecordToRegistryEntry
 } from './nurseVerificationHelpers.ts';
+import {
+  logbookService,
+  OFFICIAL_LOGBOOK_ITEMS,
+  createInitialOfficialLogbook
+} from '../data/officialPelaksanaLogbookData.ts';
+import {
+  BENCHMARK_LAPORAN_PASIEN_ROWS,
+  collectAllInputtedLogbookRows,
+  pasienLogbookService
+} from '../data/laporanPasienData.ts';
+import { aggregateShiftVerifiedLogbooks } from './dailyReportHelpers.ts';
+import { buildStaffMonthlyRecap } from './monthlyRecapHelpers.ts';
 import { PatientHDSession, MasterNurse } from '../types/dialysis.ts';
 
 const mockMasterNurses: MasterNurse[] = [
@@ -785,3 +798,291 @@ test('collectOccupiedLogbookAssets excludeSession allows editing an existing ses
   );
   assert.ok(modalEditView.findBedClaimedByOther('BED A05'));
 });
+
+test('logbookService & pasienLogbookService async verification (PJ Shift -> Kepala Ruang) and strict verified_karu Laporan gating', async () => {
+  logbookService.clearAllRecords();
+  pasienLogbookService.clearAllPatientSessions();
+
+  // Static benchmark arrays must be completely empty
+  assert.equal(BENCHMARK_LAPORAN_PASIEN_ROWS.length, 0);
+  const emptyMonthly = createInitialOfficialLogbook({
+    nurseName: 'Ners Rina S.Kep',
+    month: 10,
+    year: 2026
+  });
+  assert.equal(emptyMonthly.verifiedDays?.filter(Boolean).length ?? 0, 0);
+
+  // 1. Perawat Pelaksana saves a 'draft' record -> NOT visible in pending verifications or verified reports
+  await logbookService.saveRecord({
+    id: 'rec-rina-2026-10-29-pagi',
+    tanggal: '2026-10-29',
+    shift: 'Pagi',
+    perawatId: 'rina',
+    namaPerawat: 'Ners Rina S.Kep',
+    nipPerawat: '19950110',
+    perawatRole: 'perawat_pelaksana',
+    targetRole: 'pj_shift',
+    targetVerifierName: 'M. Haikal Malilang, A.Md. Kep.',
+    statusVerifikasi: 'draft',
+    items: OFFICIAL_LOGBOOK_ITEMS.map((spo) => ({
+      code: spo.code,
+      verified: true,
+      catatan: 'SPO dilaksanakan'
+    })),
+    patients: [
+      {
+        id: 'pat-1',
+        bedNumber: 'BED A01',
+        patientName: 'Tn. Budi Santoso',
+        medicalRecord: '900101',
+        status: 'belum_diajukan'
+      }
+    ]
+  });
+
+  assert.equal((await logbookService.getPendingVerifications('PJ Shift')).length, 0);
+  assert.equal((await logbookService.getPendingVerifications('Kepala Ruang')).length, 0);
+  assert.equal((await logbookService.getVerifiedReports('2026-10-29', '2026-10-29')).length, 0);
+  assert.equal(
+    collectAllInputtedLogbookRows({
+      sessions: [],
+      activeDateIso: '2026-10-29',
+      activeShift: 'Pagi',
+      masterNurses: mockMasterNurses
+    }).length,
+    0
+  );
+
+  // 2. Perawat Pelaksana submits ('submitted') -> appears in PJ Shift pending queue, NOT in verified reports
+  await logbookService.saveRecord({
+    id: 'rec-rina-2026-10-29-pagi',
+    tanggal: '2026-10-29',
+    shift: 'Pagi',
+    perawatId: 'rina',
+    namaPerawat: 'Ners Rina S.Kep',
+    nipPerawat: '19950110',
+    perawatRole: 'perawat_pelaksana',
+    targetRole: 'pj_shift',
+    targetVerifierName: 'M. Haikal Malilang, A.Md. Kep.',
+    statusVerifikasi: 'submitted',
+    items: OFFICIAL_LOGBOOK_ITEMS.map((spo) => ({
+      code: spo.code,
+      verified: true,
+      catatan: 'SPO dilaksanakan'
+    })),
+    patients: [
+      {
+        id: 'pat-1',
+        bedNumber: 'BED A01',
+        patientName: 'Tn. Budi Santoso',
+        medicalRecord: '900101',
+        status: 'diajukan'
+      }
+    ]
+  });
+
+  await pasienLogbookService.savePatientSession({
+    id: 'ps-rina-2026-10-29-pagi-pat-1',
+    no: 1,
+    tanggal: '2026-10-29',
+    shift: 'Pagi',
+    noRm: '900101',
+    namaPasien: 'Tn. Budi Santoso',
+    statusRawat: 'Rawat Jalan',
+    ruangKategori: 'Reguler',
+    noBedMesin: 'BED A01',
+    aksesVaskular: 'AV Shunt (Kiri)',
+    waktuMulai: '07:00',
+    waktuSelesai: '11:30',
+    durasiJam: 4.5,
+    bbKering: 60,
+    bbPreHd: 62.4,
+    bbPostHd: 60,
+    qb: 220,
+    qd: 500,
+    targetUf: 2400,
+    ktV: 1.4,
+    capaianUf: 2400,
+    tdPre: '140/85',
+    tdPost: '125/80',
+    dialiser: 'High Flux (SAS HF 18)',
+    heparinisasi: 'Reguler (5000 IU)',
+    komplikasiIntraHd: 'Tidak ada',
+    tindakanAdvisDpjp: 'Tidak ada',
+    statusMesin: 'Siap Pakai',
+    metodeDisinfeksi: 'Heat Clean',
+    ketTeknis: 'Normal',
+    jamCekRo: '06:30',
+    kondisiAirRo: 'Memenuhi Syarat',
+    perawatPelaksana: 'Ners Rina S.Kep',
+    perawatId: 'rina',
+    statusVerifikasi: 'submitted'
+  });
+
+  const pendingPj = await logbookService.getPendingVerifications(
+    'PJ Shift',
+    'M. Haikal Malilang, A.Md. Kep.'
+  );
+  assert.equal(pendingPj.length, 1);
+  assert.equal(pendingPj[0].namaPerawat, 'Ners Rina S.Kep');
+  assert.equal((await pasienLogbookService.getSessionsForVerification('PJ Shift')).length, 1);
+  assert.equal((await logbookService.getVerifiedReports('2026-10-29', '2026-10-29')).length, 0);
+
+  // 3. PJ Shift verifies ('verified_pj') -> leaves PJ Shift pending queue, enters Kepala Ruang queue, STILL NOT in verified_karu reports!
+  const afterPjVerify = await logbookService.verifyRecord('rec-rina-2026-10-29-pagi', 'PJ Shift', {
+    verifikatorId: 'nurse-01',
+    verifikatorNama: 'M. Haikal Malilang, A.Md. Kep.',
+    verifierNotes: 'Lengkap sesuai SPO'
+  });
+  await pasienLogbookService.verifyPatientSession(
+    'ps-rina-2026-10-29-pagi-pat-1',
+    'nurse-01',
+    'PJ Shift',
+    {
+      verifikatorNama: 'M. Haikal Malilang, A.Md. Kep.'
+    }
+  );
+  assert.ok(afterPjVerify);
+  assert.equal(afterPjVerify.statusVerifikasi, 'verified_pj');
+  assert.equal(
+    (await logbookService.getPendingVerifications('PJ Shift', 'M. Haikal Malilang, A.Md. Kep.'))
+      .length,
+    0
+  );
+  assert.equal((await pasienLogbookService.getSessionsForVerification('PJ Shift')).length, 0);
+
+  const pendingKaruAfterPj = await logbookService.getPendingVerifications(
+    'Kepala Ruang',
+    'Twis Fertilianti PW., S.Kep., Ns.'
+  );
+  assert.equal(pendingKaruAfterPj.length, 1);
+  assert.equal((await pasienLogbookService.getSessionsForVerification('Kepala Ruang')).length, 1);
+
+  const karuMappedEntry = convertLogbookRecordToRegistryEntry(pendingKaruAfterPj[0], {
+    viewerRole: 'kepala_ruangan'
+  });
+  assert.equal(karuMappedEntry.status, 'diajukan');
+
+  // Strict rule: 'verified_pj' must NOT appear in verified reports until Kepala Ruang approves ('verified_karu')
+  assert.equal((await logbookService.getVerifiedReports('2026-10-29', '2026-10-29')).length, 0);
+  assert.equal(
+    (await pasienLogbookService.getVerifiedPatientReports('2026-10-29', '2026-10-29')).length,
+    0
+  );
+
+  // 4. Kepala Ruang finalizes verification ('verified_karu') -> pending queue becomes 0, enters getVerifiedReports() & getVerifiedPatientReports()!
+  const afterKaruVerify = await logbookService.verifyRecord(
+    'rec-rina-2026-10-29-pagi',
+    'Kepala Ruang',
+    {
+      verifikatorId: 'nurse-02',
+      verifikatorNama: 'Twis Fertilianti PW., S.Kep., Ns.',
+      verifierNotes: 'Disahkan Kepala Ruang'
+    }
+  );
+  await pasienLogbookService.verifyPatientSession(
+    'ps-rina-2026-10-29-pagi-pat-1',
+    'nurse-02',
+    'Kepala Ruang',
+    {
+      verifikatorNama: 'Twis Fertilianti PW., S.Kep., Ns.'
+    }
+  );
+  assert.ok(afterKaruVerify);
+  assert.equal(afterKaruVerify.statusVerifikasi, 'verified_karu');
+  assert.equal(
+    (
+      await logbookService.getPendingVerifications(
+        'Kepala Ruang',
+        'Twis Fertilianti PW., S.Kep., Ns.'
+      )
+    ).length,
+    0
+  );
+  assert.equal((await pasienLogbookService.getSessionsForVerification('Kepala Ruang')).length, 0);
+
+  const verifiedLogs = await logbookService.getVerifiedReports('2026-10-29', '2026-10-29');
+  const verifiedPatientRows = await pasienLogbookService.getVerifiedPatientReports(
+    '2026-10-29',
+    '2026-10-29'
+  );
+  assert.equal(verifiedLogs.length, 1);
+  assert.equal(verifiedPatientRows.length, 1);
+
+  const laporanPasienRows = collectAllInputtedLogbookRows({
+    sessions: [],
+    activeDateIso: '2026-10-29',
+    activeShift: 'Pagi',
+    masterNurses: mockMasterNurses,
+    cloudVerifiedLogbooks: verifiedLogs,
+    cloudVerifiedPatientRows: verifiedPatientRows
+  });
+  assert.equal(laporanPasienRows.length, 1);
+  assert.equal(laporanPasienRows[0].namaPasien, 'Tn. Budi Santoso');
+  assert.equal(laporanPasienRows[0].noRm, '900101');
+  assert.equal(laporanPasienRows[0].statusVerifikasi, 'verified_karu');
+
+  const lapHarianSummary = aggregateShiftVerifiedLogbooks({
+    sessions: [],
+    registryEntries: [],
+    masterNurses: mockMasterNurses,
+    masterPatients: [],
+    activeDateLabel: 'Kamis, 29 Oktober 2026',
+    activeShift: 'Pagi',
+    fallbackShiftInfo: {
+      hospitalName: 'RS HAPPY LAND',
+      unitName: 'INSTALASI HD',
+      date: 'Kamis, 29 Oktober 2026',
+      shift: 'Pagi',
+      shiftHours: '07.00 - 14.00 WIB',
+      pjShift: 'M. Haikal Malilang, A.Md. Kep.',
+      kepalaRuangan: 'Twis Fertilianti PW., S.Kep., Ns.',
+      dokterDpjp: 'dr. Sp.PD-KGH',
+      dokterJaga: 'dr. Jaga',
+      totalPerawatDinas: 1,
+      detailPerawat: '1 Orang',
+      perawatRatio: '1 : 1',
+      tenagaPendukung: '-',
+      pjShiftBerikutnya: '-'
+    }
+  });
+  assert.equal(lapHarianSummary.totalPasienDilayani, 1);
+  assert.equal(lapHarianSummary.verifiedSessions[0].patientName, 'Tn. Budi Santoso');
+
+  const lapBulananRecap = buildStaffMonthlyRecap({
+    nurseName: 'Ners Rina S.Kep',
+    nurseNip: '19950110',
+    userRole: 'perawat_pelaksana',
+    targetMonth: 10,
+    targetYear: 2026
+  });
+  assert.equal(lapBulananRecap.verifiedDaysCount, 1);
+  assert.equal(lapBulananRecap.totalVerifiedPatientsInMonth, 1);
+
+  // 5. Requesting revision unlocks record back to 'draft' and removes it from verified reports
+  const afterRevision = await logbookService.requestRevision(
+    'rec-rina-2026-10-29-pagi',
+    'Kepala Ruang',
+    {
+      verifikatorNama: 'Twis Fertilianti PW., S.Kep., Ns.',
+      verifierNotes: 'Mohon lengkapi tekanan darah post-HD'
+    }
+  );
+  await pasienLogbookService.requestPatientSessionRevision(
+    'ps-rina-2026-10-29-pagi-pat-1',
+    'nurse-02',
+    'Kepala Ruang',
+    'Mohon lengkapi tekanan darah post-HD'
+  );
+  assert.ok(afterRevision);
+  assert.equal(afterRevision.statusVerifikasi, 'draft');
+  assert.equal((await logbookService.getVerifiedReports('2026-10-29', '2026-10-29')).length, 0);
+  assert.equal(
+    (await pasienLogbookService.getVerifiedPatientReports('2026-10-29', '2026-10-29')).length,
+    0
+  );
+
+  logbookService.clearAllRecords();
+  pasienLogbookService.clearAllPatientSessions();
+});
+

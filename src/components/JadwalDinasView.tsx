@@ -43,8 +43,11 @@ import {
   computeNurseMonthlyStat,
   computeDoctorMonthlyStat,
   exportMonthlyScheduleMatrixXlsx,
-  stripLegacySyntheticSchedules
+  stripLegacySyntheticSchedules,
+  mergeNurseSchedules,
+  mergeDoctorSchedules
 } from '../utils/monthlyScheduleMatrixHelpers.ts';
+import { scheduleService } from '../data/mockScheduleData.ts';
 import { printDocumentWithOrientation, downloadElementAsPdf } from '../utils/printHelpers.ts';
 import { RshlLogo } from './RshlLogo.tsx';
 import {
@@ -68,7 +71,9 @@ import {
   X,
   ArrowRight,
   Upload,
-  Info
+  Info,
+  Loader2,
+  ShieldCheck
 } from 'lucide-react';
 import { ImportNurseScheduleSpreadsheetModal } from './ImportNurseScheduleSpreadsheetModal.tsx';
 
@@ -140,9 +145,20 @@ export const JadwalDinasView: React.FC<JadwalDinasViewProps> = ({
     setMatrixTab(initialScheduleTab);
   }, [initialScheduleTab]);
 
-  // Supervisor-only optional daily sync view
+  // Supervisor-only optional daily sync view & Active Date for Cloud Schedule Lookup
   const [supervisorViewMode, setSupervisorViewMode] = useState<'matrix' | 'daily_sync'>('matrix');
   const [syncTargetDate, setSyncTargetDate] = useState<string>(activeReferenceIso);
+  const [activeScheduleDate, setActiveScheduleDate] = useState<string>(activeReferenceIso);
+
+  // Cloud Firestore Loading, Saving, and Error States
+  const [isLoadingSchedules, setIsLoadingSchedules] = useState<boolean>(true);
+  const [isSavingSchedule, setIsSavingSchedule] = useState<boolean>(false);
+  const [scheduleCloudError, setScheduleCloudError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setActiveScheduleDate(activeReferenceIso);
+    setSyncTargetDate(activeReferenceIso);
+  }, [activeReferenceIso]);
 
   // Interactive Matrix Editing Controls
   const [interactionMode, setInteractionMode] = useState<CellInteractionMode>('brush');
@@ -164,6 +180,79 @@ export const JadwalDinasView: React.FC<JadwalDinasViewProps> = ({
   const [detailModal, setDetailModal] = useState<CellDetailModalState | null>(null);
   const [isImportSpreadsheetOpen, setIsImportSpreadsheetOpen] = useState<boolean>(false);
   const [isExportingPdf, setIsExportingPdf] = useState(false);
+
+  // Muat jadwal Perawat & Dokter dari Cloud Firestore berdasarkan tanggal aktif + seluruh matriks
+  const loadCloudSchedulesForDate = React.useCallback(
+    async (dateIso: string) => {
+      setIsLoadingSchedules(true);
+      setScheduleCloudError(null);
+      try {
+        const [dailyNurses, dailyDoctors, allNurses, allDoctors] = await Promise.all([
+          scheduleService.getNurseSchedules(dateIso),
+          scheduleService.getDoctorSchedules(dateIso),
+          scheduleService.getAllNurseSchedules(),
+          scheduleService.getAllDoctorSchedules()
+        ]);
+
+        const mergedCloudNurses = stripLegacySyntheticSchedules(
+          mergeNurseSchedules(allNurses, dailyNurses)
+        );
+        const mergedCloudDoctors = stripLegacySyntheticSchedules(
+          mergeDoctorSchedules(allDoctors, dailyDoctors)
+        );
+
+        if (mergedCloudNurses.length > 0) {
+          setNurseSchedules((prev) => mergeNurseSchedules(prev, mergedCloudNurses));
+        }
+        if (mergedCloudDoctors.length > 0) {
+          setDoctorSchedules((prev) => mergeDoctorSchedules(prev, mergedCloudDoctors));
+        }
+      } catch (err) {
+        console.error('Gagal mengambil jadwal dinas dari Cloud Firestore:', err);
+        setScheduleCloudError(
+          'Gagal mengambil jadwal Dokter dan Perawat dari jaringan Cloud Firestore. Silakan coba muat ulang.'
+        );
+      } finally {
+        setIsLoadingSchedules(false);
+      }
+    },
+    [setNurseSchedules, setDoctorSchedules]
+  );
+
+  useEffect(() => {
+    const targetIso = supervisorViewMode === 'daily_sync' ? syncTargetDate : activeScheduleDate;
+    void loadCloudSchedulesForDate(targetIso);
+  }, [activeScheduleDate, syncTargetDate, supervisorViewMode, loadCloudSchedulesForDate]);
+
+  // Real-time subscription lintas perangkat untuk koleksi nurse_schedules & doctor_schedules
+  useEffect(() => {
+    const unsubNurses = scheduleService.subscribeAllNurseSchedules(
+      (entries, isInitialized) => {
+        if (!isInitialized) return;
+        const cleaned = stripLegacySyntheticSchedules(entries);
+        setNurseSchedules((prev) => mergeNurseSchedules(prev, cleaned));
+      },
+      (err) => {
+        console.error('Subscription error nurse_schedules:', err);
+      }
+    );
+
+    const unsubDoctors = scheduleService.subscribeAllDoctorSchedules(
+      (entries, isInitialized) => {
+        if (!isInitialized) return;
+        const cleaned = stripLegacySyntheticSchedules(entries);
+        setDoctorSchedules((prev) => mergeDoctorSchedules(prev, cleaned));
+      },
+      (err) => {
+        console.error('Subscription error doctor_schedules:', err);
+      }
+    );
+
+    return () => {
+      unsubNurses();
+      unsubDoctors();
+    };
+  }, [setNurseSchedules, setDoctorSchedules]);
 
   useEffect(() => {
     const stopDrag = () => setIsDraggingPaint(false);
@@ -386,7 +475,89 @@ export const JadwalDinasView: React.FC<JadwalDinasViewProps> = ({
     });
   };
 
-  const handleNurseCellActivate = (
+  const persistSingleNurseCellToCloud = async (
+    nurse: MasterNurse,
+    isoDate: string,
+    targetCode: NurseMatrixCode,
+    notes?: string
+  ) => {
+    const prevEntry = getNurseEntry(nurse, isoDate);
+    const nextSchedules = applyNurseMatrixCell(nurseSchedules, nurse, isoDate, targetCode, notes);
+    setNurseSchedules(nextSchedules);
+
+    const updatedEntry = nextSchedules.find(
+      (s) =>
+        s.date === isoDate &&
+        (s.nurseId === nurse.id ||
+          s.nurseName.trim().toLowerCase() === nurse.name.trim().toLowerCase())
+    );
+
+    setIsSavingSchedule(true);
+    setScheduleCloudError(null);
+    try {
+      if (updatedEntry) {
+        await scheduleService.saveNurseSchedule(updatedEntry);
+        if (prevEntry && prevEntry.id !== updatedEntry.id) {
+          await scheduleService.deleteNurseSchedule(prevEntry.id);
+        }
+      } else if (prevEntry) {
+        await scheduleService.deleteNurseSchedule(prevEntry.id);
+      }
+    } catch (err) {
+      console.error('Gagal menyimpan jadwal perawat ke Cloud Firestore:', err);
+      setScheduleCloudError(
+        `Gagal menyimpan perubahan jadwal ${nurse.name} ke Cloud Firestore.`
+      );
+    } finally {
+      setIsSavingSchedule(false);
+    }
+  };
+
+  const persistSingleDoctorCellToCloud = async (
+    doctor: MasterDoctor,
+    isoDate: string,
+    targetCode: DoctorMatrixCode,
+    notes?: string
+  ) => {
+    const prevEntry = getDoctorEntry(doctor, isoDate);
+    const nextSchedules = applyDoctorMatrixCell(
+      doctorSchedules,
+      doctor,
+      isoDate,
+      targetCode,
+      notes
+    );
+    setDoctorSchedules(nextSchedules);
+
+    const updatedEntry = nextSchedules.find(
+      (d) =>
+        d.date === isoDate &&
+        (d.doctorId === doctor.id ||
+          d.doctorName.trim().toLowerCase() === doctor.name.trim().toLowerCase())
+    );
+
+    setIsSavingSchedule(true);
+    setScheduleCloudError(null);
+    try {
+      if (updatedEntry) {
+        await scheduleService.saveDoctorSchedule(updatedEntry);
+        if (prevEntry && prevEntry.id !== updatedEntry.id) {
+          await scheduleService.deleteDoctorSchedule(prevEntry.id);
+        }
+      } else if (prevEntry) {
+        await scheduleService.deleteDoctorSchedule(prevEntry.id);
+      }
+    } catch (err) {
+      console.error('Gagal menyimpan jadwal dokter ke Cloud Firestore:', err);
+      setScheduleCloudError(
+        `Gagal menyimpan perubahan jadwal ${doctor.name} ke Cloud Firestore.`
+      );
+    } finally {
+      setIsSavingSchedule(false);
+    }
+  };
+
+  const handleNurseCellActivate = async (
     nurse: MasterNurse,
     isoDate: string,
     dayLabel: string,
@@ -402,18 +573,16 @@ export const JadwalDinasView: React.FC<JadwalDinasViewProps> = ({
     if (interactionMode === 'cycle' && !isDragEnter) {
       const currentCode = entryToNurseMatrixCode(getNurseEntry(nurse, isoDate));
       const nextCode = getNextNurseMatrixCode(currentCode, nurse.role);
-      setNurseSchedules((prev) => applyNurseMatrixCell(prev, nurse, isoDate, nextCode));
+      await persistSingleNurseCellToCloud(nurse, isoDate, nextCode);
       return;
     }
 
     if (interactionMode === 'brush') {
-      setNurseSchedules((prev) =>
-        applyNurseMatrixCell(prev, nurse, isoDate, activeNurseBrush)
-      );
+      await persistSingleNurseCellToCloud(nurse, isoDate, activeNurseBrush);
     }
   };
 
-  const handleDoctorCellActivate = (
+  const handleDoctorCellActivate = async (
     doctor: MasterDoctor,
     isoDate: string,
     dayLabel: string,
@@ -429,52 +598,45 @@ export const JadwalDinasView: React.FC<JadwalDinasViewProps> = ({
     if (interactionMode === 'cycle' && !isDragEnter) {
       const currentCode = entryToDoctorMatrixCode(getDoctorEntry(doctor, isoDate));
       const nextCode = getNextDoctorMatrixCode(currentCode);
-      setDoctorSchedules((prev) => applyDoctorMatrixCell(prev, doctor, isoDate, nextCode));
+      await persistSingleDoctorCellToCloud(doctor, isoDate, nextCode);
       return;
     }
 
     if (interactionMode === 'brush') {
-      setDoctorSchedules((prev) =>
-        applyDoctorMatrixCell(prev, doctor, isoDate, activeDoctorBrush)
-      );
+      await persistSingleDoctorCellToCloud(doctor, isoDate, activeDoctorBrush);
     }
   };
 
-  const handleSaveDetailModal = (e: React.FormEvent) => {
+  const handleSaveDetailModal = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!detailModal) return;
 
-    if (detailModal.kind === 'perawat' && detailModal.nurse) {
-      const targetNurse = detailModal.nurse;
-      setNurseSchedules((prev) =>
-        applyNurseMatrixCell(
-          prev,
-          targetNurse,
-          detailModal.isoDate,
-          detailModal.nurseCode,
-          detailModal.notes
-        )
+    const modalSnapshot = detailModal;
+    setDetailModal(null);
+
+    if (modalSnapshot.kind === 'perawat' && modalSnapshot.nurse) {
+      const targetNurse = modalSnapshot.nurse;
+      await persistSingleNurseCellToCloud(
+        targetNurse,
+        modalSnapshot.isoDate,
+        modalSnapshot.nurseCode,
+        modalSnapshot.notes
       );
       showFeedback(
-        `Jadwal ${targetNurse.name} (${detailModal.dayLabel}) diperbarui ke [${detailModal.nurseCode}].`
+        `Jadwal ${targetNurse.name} (${modalSnapshot.dayLabel}) tersimpan di Cloud [${modalSnapshot.nurseCode}].`
       );
-    } else if (detailModal.kind === 'dokter' && detailModal.doctor) {
-      const targetDoc = detailModal.doctor;
-      setDoctorSchedules((prev) =>
-        applyDoctorMatrixCell(
-          prev,
-          targetDoc,
-          detailModal.isoDate,
-          detailModal.doctorCode,
-          detailModal.notes
-        )
+    } else if (modalSnapshot.kind === 'dokter' && modalSnapshot.doctor) {
+      const targetDoc = modalSnapshot.doctor;
+      await persistSingleDoctorCellToCloud(
+        targetDoc,
+        modalSnapshot.isoDate,
+        modalSnapshot.doctorCode,
+        modalSnapshot.notes
       );
       showFeedback(
-        `Jadwal ${targetDoc.name} (${detailModal.dayLabel}) diperbarui ke [${detailModal.doctorCode}].`
+        `Jadwal ${targetDoc.name} (${modalSnapshot.dayLabel}) tersimpan di Cloud [${modalSnapshot.doctorCode}].`
       );
     }
-
-    setDetailModal(null);
   };
 
   // Batch Actions with Confirmation
@@ -519,105 +681,183 @@ export const JadwalDinasView: React.FC<JadwalDinasViewProps> = ({
     }
   };
 
-  const executeBatchAction = (
+  const executeBatchAction = async (
     action: PendingBatchConfirm['action'],
     target: 'perawat' | 'dokter' | 'all'
   ) => {
     setPendingConfirm(null);
+    setIsSavingSchedule(true);
+    setScheduleCloudError(null);
 
-    if (action === 'purge_default') {
-      const cleanNurses = stripLegacySyntheticSchedules(nurseSchedules);
-      const cleanDoctors = stripLegacySyntheticSchedules(doctorSchedules);
-      setNurseSchedules(cleanNurses);
-      setDoctorSchedules(cleanDoctors);
-      showFeedback(
-        'Jadwal shift bawaan sistem berhasil dihapus bersih. Matriks jadwal perawat dan dokter kini steril dan siap diisi data riil.'
+    try {
+      if (action === 'purge_default') {
+        const cleanNurses = stripLegacySyntheticSchedules(nurseSchedules);
+        const cleanDoctors = stripLegacySyntheticSchedules(doctorSchedules);
+        const cleanNurseIds = new Set(cleanNurses.map((s) => s.id));
+        const cleanDocIds = new Set(cleanDoctors.map((d) => d.id));
+        const removedNurseIds = nurseSchedules
+          .filter((s) => !cleanNurseIds.has(s.id))
+          .map((s) => s.id);
+        const removedDocIds = doctorSchedules
+          .filter((d) => !cleanDocIds.has(d.id))
+          .map((d) => d.id);
+
+        setNurseSchedules(cleanNurses);
+        setDoctorSchedules(cleanDoctors);
+
+        await Promise.all([
+          scheduleService.saveNurseSchedulesBatch(cleanNurses, removedNurseIds),
+          scheduleService.saveDoctorSchedulesBatch(cleanDoctors, removedDocIds)
+        ]);
+
+        showFeedback(
+          'Jadwal shift bawaan sistem berhasil dihapus bersih di Cloud Firestore. Matriks kini siap diisi data riil.'
+        );
+        return;
+      }
+
+      if (action === 'fill_standard') {
+        if (target === 'perawat') {
+          const generated = generateMonthlyNurseRoster(
+            selectedYear,
+            selectedMonth,
+            orderedActiveNurses
+          );
+          const nextEntries = replaceMonthNurseSchedules(
+            nurseSchedules,
+            selectedYear,
+            selectedMonth,
+            generated
+          );
+          const genIdSet = new Set(generated.map((s) => s.id));
+          const deletedIds = monthNurseSchedules
+            .filter((s) => !genIdSet.has(s.id))
+            .map((s) => s.id);
+
+          setNurseSchedules(nextEntries);
+          await scheduleService.saveNurseSchedulesBatch(generated, deletedIds);
+          showFeedback(
+            `Matriks bulanan Perawat (${monthName} ${selectedYear}) berhasil dikunci ke Cloud untuk ${orderedActiveNurses.length} staf.`
+          );
+        } else {
+          const generated = generateMonthlyDoctorRoster(
+            selectedYear,
+            selectedMonth,
+            orderedActiveDoctors
+          );
+          const nextEntries = replaceMonthDoctorSchedules(
+            doctorSchedules,
+            selectedYear,
+            selectedMonth,
+            generated
+          );
+          const genIdSet = new Set(generated.map((d) => d.id));
+          const deletedIds = monthDoctorSchedules
+            .filter((d) => !genIdSet.has(d.id))
+            .map((d) => d.id);
+
+          setDoctorSchedules(nextEntries);
+          await scheduleService.saveDoctorSchedulesBatch(generated, deletedIds);
+          showFeedback(
+            `Matriks bulanan Dokter (${monthName} ${selectedYear}) berhasil dikunci ke Cloud untuk ${orderedActiveDoctors.length} dokter.`
+          );
+        }
+        return;
+      }
+
+      if (action === 'copy_prev') {
+        if (target === 'perawat') {
+          const res = copyPreviousMonthNurseRoster(
+            nurseSchedules,
+            selectedYear,
+            selectedMonth,
+            orderedActiveNurses
+          );
+          if (res.copiedCount === 0) {
+            showFeedback(
+              'Bulan sebelumnya belum memiliki data jadwal perawat untuk disalin.',
+              'warning'
+            );
+            return;
+          }
+          const monthAdded = res.entries.filter((s) => s.date.startsWith(monthPrefix));
+          const addedIdSet = new Set(monthAdded.map((s) => s.id));
+          const deletedIds = monthNurseSchedules
+            .filter((s) => !addedIdSet.has(s.id))
+            .map((s) => s.id);
+
+          setNurseSchedules(res.entries);
+          await scheduleService.saveNurseSchedulesBatch(monthAdded, deletedIds);
+          showFeedback(
+            `Berhasil menyalin & menyimpan ${res.copiedCount} sel jadwal perawat ke Cloud (${monthName} ${selectedYear}).`
+          );
+        } else {
+          const res = copyPreviousMonthDoctorRoster(
+            doctorSchedules,
+            selectedYear,
+            selectedMonth,
+            orderedActiveDoctors
+          );
+          if (res.copiedCount === 0) {
+            showFeedback(
+              'Bulan sebelumnya belum memiliki data jadwal dokter untuk disalin.',
+              'warning'
+            );
+            return;
+          }
+          const monthAdded = res.entries.filter((d) => d.date.startsWith(monthPrefix));
+          const addedIdSet = new Set(monthAdded.map((d) => d.id));
+          const deletedIds = monthDoctorSchedules
+            .filter((d) => !addedIdSet.has(d.id))
+            .map((d) => d.id);
+
+          setDoctorSchedules(res.entries);
+          await scheduleService.saveDoctorSchedulesBatch(monthAdded, deletedIds);
+          showFeedback(
+            `Berhasil menyalin & menyimpan ${res.copiedCount} sel jadwal dokter ke Cloud (${monthName} ${selectedYear}).`
+          );
+        }
+        return;
+      }
+
+      if (action === 'clear_month') {
+        if (target === 'perawat') {
+          const deletedIds = monthNurseSchedules.map((s) => s.id);
+          const nextEntries = replaceMonthNurseSchedules(
+            nurseSchedules,
+            selectedYear,
+            selectedMonth,
+            []
+          );
+          setNurseSchedules(nextEntries);
+          await scheduleService.saveNurseSchedulesBatch([], deletedIds);
+          showFeedback(
+            `Matriks jadwal perawat bulan ${monthName} ${selectedYear} telah dikosongkan di Cloud.`,
+            'info'
+          );
+        } else {
+          const deletedIds = monthDoctorSchedules.map((d) => d.id);
+          const nextEntries = replaceMonthDoctorSchedules(
+            doctorSchedules,
+            selectedYear,
+            selectedMonth,
+            []
+          );
+          setDoctorSchedules(nextEntries);
+          await scheduleService.saveDoctorSchedulesBatch([], deletedIds);
+          showFeedback(
+            `Matriks jadwal dokter bulan ${monthName} ${selectedYear} telah dikosongkan di Cloud.`,
+            'info'
+          );
+        }
+      }
+    } catch (err) {
+      console.error('Gagal mengeksekusi aksi jadwal batch ke Cloud Firestore:', err);
+      setScheduleCloudError(
+        'Terjadi kendala saat menyimpan perubahan jadwal ke Cloud Firestore.'
       );
-      return;
-    }
-
-    if (action === 'fill_standard') {
-      if (target === 'perawat') {
-        const generated = generateMonthlyNurseRoster(
-          selectedYear,
-          selectedMonth,
-          orderedActiveNurses
-        );
-        setNurseSchedules((prev) =>
-          replaceMonthNurseSchedules(prev, selectedYear, selectedMonth, generated)
-        );
-        showFeedback(
-          `Matriks bulanan Perawat (${monthName} ${selectedYear}) berhasil diisi untuk ${orderedActiveNurses.length} staf.`
-        );
-      } else {
-        const generated = generateMonthlyDoctorRoster(
-          selectedYear,
-          selectedMonth,
-          orderedActiveDoctors
-        );
-        setDoctorSchedules((prev) =>
-          replaceMonthDoctorSchedules(prev, selectedYear, selectedMonth, generated)
-        );
-        showFeedback(
-          `Matriks bulanan Dokter (${monthName} ${selectedYear}) berhasil diisi untuk ${orderedActiveDoctors.length} dokter.`
-        );
-      }
-      return;
-    }
-
-    if (action === 'copy_prev') {
-      if (target === 'perawat') {
-        const res = copyPreviousMonthNurseRoster(
-          nurseSchedules,
-          selectedYear,
-          selectedMonth,
-          orderedActiveNurses
-        );
-        if (res.copiedCount === 0) {
-          showFeedback(
-            'Bulan sebelumnya belum memiliki data jadwal perawat untuk disalin.',
-            'warning'
-          );
-          return;
-        }
-        setNurseSchedules(res.entries);
-        showFeedback(
-          `Berhasil menyalin ${res.copiedCount} sel jadwal perawat dari bulan sebelumnya ke ${monthName} ${selectedYear}.`
-        );
-      } else {
-        const res = copyPreviousMonthDoctorRoster(
-          doctorSchedules,
-          selectedYear,
-          selectedMonth,
-          orderedActiveDoctors
-        );
-        if (res.copiedCount === 0) {
-          showFeedback(
-            'Bulan sebelumnya belum memiliki data jadwal dokter untuk disalin.',
-            'warning'
-          );
-          return;
-        }
-        setDoctorSchedules(res.entries);
-        showFeedback(
-          `Berhasil menyalin ${res.copiedCount} sel jadwal dokter dari bulan sebelumnya ke ${monthName} ${selectedYear}.`
-        );
-      }
-      return;
-    }
-
-    if (action === 'clear_month') {
-      if (target === 'perawat') {
-        setNurseSchedules((prev) =>
-          replaceMonthNurseSchedules(prev, selectedYear, selectedMonth, [])
-        );
-        showFeedback(`Matriks jadwal perawat bulan ${monthName} ${selectedYear} telah dikosongkan.`, 'info');
-      } else {
-        setDoctorSchedules((prev) =>
-          replaceMonthDoctorSchedules(prev, selectedYear, selectedMonth, [])
-        );
-        showFeedback(`Matriks jadwal dokter bulan ${monthName} ${selectedYear} telah dikosongkan.`, 'info');
-      }
+    } finally {
+      setIsSavingSchedule(false);
     }
   };
 
@@ -825,6 +1065,55 @@ export const JadwalDinasView: React.FC<JadwalDinasViewProps> = ({
                 </button>
               </div>
 
+              {/* Active Date Cloud Schedule Picker */}
+              <div className="inline-flex items-center gap-1.5 bg-slate-100/90 border border-slate-200 rounded-xl px-2.5 py-1.5 text-xs font-semibold text-slate-700 tabular-nums">
+                <Calendar className="w-3.5 h-3.5 text-blue-700 shrink-0" />
+                <span className="text-[11px] text-slate-500">Tanggal Aktif:</span>
+                <input
+                  type="date"
+                  aria-label="Pilih Tanggal Aktif Jadwal Cloud"
+                  value={activeScheduleDate}
+                  onChange={(e) => {
+                    const iso = e.target.value;
+                    if (!iso) return;
+                    setActiveScheduleDate(iso);
+                    const ym = parseYearMonthFromIso(iso);
+                    setSelectedYear(ym.year);
+                    setSelectedMonth(ym.month);
+                  }}
+                  className="bg-transparent font-bold text-slate-900 outline-hidden cursor-pointer text-xs"
+                />
+                <button
+                  type="button"
+                  onClick={() => void loadCloudSchedulesForDate(activeScheduleDate)}
+                  disabled={isLoadingSchedules}
+                  title="Muat ulang jadwal dari Cloud Firestore"
+                  className="p-1 rounded-lg hover:bg-white text-slate-600 disabled:opacity-50 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isLoadingSchedules ? 'animate-spin text-blue-700' : ''}`} />
+                </button>
+              </div>
+
+              {/* Cloud Sync & Saving Indicator */}
+              <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-50 border border-slate-200 text-[11px] font-bold text-slate-700 tabular-nums">
+                {isLoadingSchedules ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 text-blue-700 animate-spin shrink-0" />
+                    <span>Memuat Cloud...</span>
+                  </>
+                ) : isSavingSchedule ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 text-amber-600 animate-spin shrink-0" />
+                    <span>Menyimpan ke Cloud...</span>
+                  </>
+                ) : (
+                  <>
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                    <span>Terkunci di Cloud</span>
+                  </>
+                )}
+              </div>
+
               {/* Action Buttons */}
               <div className="flex items-center gap-1.5 flex-wrap">
                 <button
@@ -872,7 +1161,23 @@ export const JadwalDinasView: React.FC<JadwalDinasViewProps> = ({
           </div>
         </div>
 
-        {/* 2. NOTIFICATIONS & CONFIRMATIONS */}
+        {/* 2. NOTIFICATIONS, CLOUD ERRORS & CONFIRMATIONS */}
+        {scheduleCloudError && (
+          <div className="px-4 py-3 rounded-xl border border-rose-200 bg-rose-50 text-rose-900 text-xs font-semibold flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>{scheduleCloudError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => void loadCloudSchedulesForDate(activeScheduleDate)}
+              className="px-3 py-1.5 bg-rose-700 hover:bg-rose-800 text-white rounded-lg text-xs font-bold cursor-pointer"
+            >
+              Muat Ulang Cloud
+            </button>
+          </div>
+        )}
+
         {feedbackBanner && (
           <div
             className={`px-4 py-2.5 rounded-xl border text-xs font-semibold flex items-center justify-between gap-3 ${
@@ -2160,9 +2465,31 @@ export const JadwalDinasView: React.FC<JadwalDinasViewProps> = ({
         selectedMonth={selectedMonth}
         masterNurses={orderedActiveNurses}
         existingSchedules={nurseSchedules}
-        onApplySchedules={(updatedSchedules, summaryMessage) => {
+        onApplySchedules={async (updatedSchedules, summaryMessage) => {
+          const updatedIdSet = new Set(updatedSchedules.map((s) => s.id));
+          const deletedIds = nurseSchedules
+            .filter((s) => !updatedIdSet.has(s.id))
+            .map((s) => s.id);
           setNurseSchedules(updatedSchedules);
-          showFeedback(summaryMessage, 'success');
+          setIsSavingSchedule(true);
+          setScheduleCloudError(null);
+          try {
+            const monthEntries = updatedSchedules.filter((s) =>
+              s.date.startsWith(monthPrefix)
+            );
+            await scheduleService.saveNurseSchedulesBatch(
+              monthEntries.length > 0 ? monthEntries : updatedSchedules,
+              deletedIds
+            );
+            showFeedback(summaryMessage, 'success');
+          } catch (err) {
+            console.error('Gagal menyimpan hasil impor spreadsheet ke Cloud Firestore:', err);
+            setScheduleCloudError(
+              'Gagal menyimpan hasil impor jadwal perawat ke Cloud Firestore.'
+            );
+          } finally {
+            setIsSavingSchedule(false);
+          }
         }}
       />
 

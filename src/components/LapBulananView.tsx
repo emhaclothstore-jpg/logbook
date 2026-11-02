@@ -1,15 +1,18 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import {
   MasterNurse,
   PatientHDSession,
   ShiftInfo,
   SystemAccessRole
 } from '../types/dialysis.ts';
-import { OFFICIAL_LOGBOOK_ITEMS } from '../data/officialPelaksanaLogbookData.ts';
+import { OFFICIAL_LOGBOOK_ITEMS, logbookService } from '../data/officialPelaksanaLogbookData.ts';
+import {
+  pasienLogbookService,
+  type MonthlyNurseSpoMatrixReport
+} from '../data/laporanPasienData.ts';
 import { OfficialPelaksanaLogbookPrintable } from './OfficialPelaksanaLogbookPrintable.tsx';
 import { LoginUserData } from './LoginPage.tsx';
 import {
-  buildStaffMonthlyRecap,
   buildAllStaffMonthlyRecap,
   parseIndonesianLogbookDate,
   getMonthLabel,
@@ -38,7 +41,8 @@ import {
   Filter,
   RefreshCw,
   FileText,
-  FileSpreadsheet
+  FileSpreadsheet,
+  Loader2
 } from 'lucide-react';
 import { exportMasterHemodialisaWorkbook } from '../utils/exportMasterSpreadsheet.ts';
 import type { NurseLogbookCloudData } from '../services/firebase.ts';
@@ -62,32 +66,32 @@ const BAGIAN_SECTION_HEADERS: {
   {
     bagian: 1,
     title: 'BAGIAN I: KESIAPAN FASILITAS RUANGAN & WATER TREATMENT (RO)',
-    ruleBadge: 'Nilai = 1 (1x Aktivitas / Hari)'
+    ruleBadge: 'Nilai = 1 (1x Aktivitas / Hari verified_karu)'
   },
   {
     bagian: 2,
     title: 'BAGIAN II: PERSIAPAN PERAWAT, PERALATAN, MESIN HD & ALKES (PRE-HD)',
-    ruleBadge: 'Nilai Mengikuti Pasien Kelolaan'
+    ruleBadge: 'Akumulasi Pasien Kelolaan (verified_karu)'
   },
   {
     bagian: 3,
     title: 'BAGIAN III: IDENTIFIKASI PASIEN, PENGKAJIAN PRE-HD & PATIENT SAFETY',
-    ruleBadge: 'Pasien Kelolaan (Poin 3.6 Sesuai Perawat Pelaksana Aksesing)'
+    ruleBadge: 'Akumulasi Pasien Kelolaan (verified_karu)'
   },
   {
     bagian: 4,
     title: 'BAGIAN IV: MONITORING INTRA-HD & PENCEGAHAN IKP',
-    ruleBadge: 'Nilai Mengikuti Pasien Kelolaan'
+    ruleBadge: 'Akumulasi Pasien Kelolaan (verified_karu)'
   },
   {
     bagian: 5,
     title: 'BAGIAN V: EDUKASI TERSTRUKTUR PASIEN & KELUARGA (KIE)',
-    ruleBadge: 'Nilai Mengikuti Pasien Kelolaan'
+    ruleBadge: 'Akumulasi Pasien Kelolaan (verified_karu)'
   },
   {
     bagian: 6,
     title: 'BAGIAN VI: TERMINASI AMAN, EVALUASI POST-HD, DISINFEKSI & CPPT',
-    ruleBadge: 'Nilai Mengikuti Pasien Kelolaan'
+    ruleBadge: 'Akumulasi Pasien Kelolaan (verified_karu)'
   }
 ];
 
@@ -118,17 +122,7 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
   onNavigateToLogbook,
   onNavigateToVerifikasi
 }) => {
-  // Listen to live verification and storage updates to re-render in real-time
   const [refreshTick, setRefreshTick] = useState<number>(0);
-  useEffect(() => {
-    const handleUpdate = () => setRefreshTick((t) => t + 1);
-    window.addEventListener('verification_registry_updated', handleUpdate);
-    window.addEventListener('storage', handleUpdate);
-    return () => {
-      window.removeEventListener('verification_registry_updated', handleUpdate);
-      window.removeEventListener('storage', handleUpdate);
-    };
-  }, []);
 
   const activeDateLabel = shiftInfo?.date
     ? normalizeIndonesianDateLabel(shiftInfo.date)
@@ -143,37 +137,38 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
   const [selectedMonth, setSelectedMonth] = useState<number>(() => activeParsedDate.month);
   const [selectedYear, setSelectedYear] = useState<number>(() => activeParsedDate.year);
 
-  const isPelaksana = userRole === 'perawat_pelaksana';
-  const canViewOtherNurses =
-    userRole === 'pj_shift' || userRole === 'kepala_ruangan' || userRole === 'administrator';
+  const bulanTahun = `${selectedYear}-${String(selectedMonth).padStart(2, '0')}`;
+  const monthStartIso = `${bulanTahun}-01`;
+  const monthEndIso = `${bulanTahun}-31`;
 
-  // Filter active registered staff members
+  const isPelaksana = userRole === 'perawat_pelaksana';
+
   const activeNurses = useMemo(() => {
     return masterNurses.filter((n) => n.accountStatus !== 'nonaktif');
   }, [masterNurses]);
 
-  // Identify the logged-in nurse's own name
   const loggedInNurse = useMemo(() => {
     if (!loggedInUser?.name) return null;
     return activeNurses.find((n) => isMatchingNurse(n.name, loggedInUser.name)) || null;
   }, [activeNurses, loggedInUser?.name]);
 
   const personalStaffName =
-    loggedInNurse?.name || loggedInUser?.name || activeNurses[0]?.name || 'Perawat Pelaksana';
+    loggedInNurse?.name || activeNurses[0]?.name || loggedInUser?.name || 'Perawat Pelaksana';
 
-  // Initial staff selection:
-  // - Perawat Pelaksana: STRICTLY locked to their own name
-  // - PJ Shift / Kepala Ruangan / Admin: defaults to ALL_STAFF (Unit Overview)
-  const [selectedStaff, setSelectedStaff] = useState<string>(() => {
-    if (isPelaksana) {
-      return personalStaffName;
-    }
-    return ALL_STAFF_KEY;
-  });
+  // Default langsung ke perawat aktif agar matriks horizontal 1–31 (29 poin SPO) langsung dipanggil & ditampilkan
+  const [selectedStaff, setSelectedStaff] = useState<string>(() => personalStaffName);
 
-  // Guard: if user is Perawat Pelaksana, force selectedStaff to stay locked on their own name
+  // Guard: Perawat Pelaksana terkunci pada nama sendiri; Supervisor yang masih di placeholder diselaraskan ke staf pertama
   useEffect(() => {
     if (isPelaksana && selectedStaff !== personalStaffName) {
+      setSelectedStaff(personalStaffName);
+      return;
+    }
+    if (
+      !isPelaksana &&
+      selectedStaff === 'Perawat Pelaksana' &&
+      personalStaffName !== 'Perawat Pelaksana'
+    ) {
       setSelectedStaff(personalStaffName);
     }
   }, [isPelaksana, personalStaffName, selectedStaff]);
@@ -186,7 +181,181 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
   const currentMonthLabel = getMonthLabel(selectedMonth);
   const currentMonthYearTitle = `${currentMonthLabel} ${selectedYear}`;
 
-  // Compute Unit All-Staff Recap only for supervisor / admin roles
+  // Find the selected individual nurse object
+  const activeNurseObject = useMemo(() => {
+    if (!isPelaksana && effectiveSelectedStaff === ALL_STAFF_KEY) return null;
+    const targetName = isPelaksana ? personalStaffName : effectiveSelectedStaff;
+    const found = activeNurses.find((n) => isMatchingNurse(n.name, targetName));
+    if (found) return found;
+    return {
+      id: 'nurse-selected',
+      name: targetName,
+      nip: loggedInUser?.nip || '-',
+      role: 'perawat_pelaksana',
+      systemAccess: userRole,
+      accountStatus: 'aktif'
+    } as MasterNurse;
+  }, [isPelaksana, effectiveSelectedStaff, personalStaffName, activeNurses, loggedInUser?.nip, userRole]);
+
+  const headNurseMaster = useMemo(() => {
+    const karuName = shiftInfo?.kepalaRuangan || 'TWIS FERTILIANTI PW';
+    return masterNurses.find(
+      (n) => n.role === 'kepala_ruangan' || isMatchingNurse(n.name, karuName)
+    );
+  }, [masterNurses, shiftInfo?.kepalaRuangan]);
+
+  // =========================================================================
+  // CLOUD FIRESTORE FETCH: pasienLogbookService.getMonthlyReportByNurse(namaPerawat, bulanTahun)
+  // Melacak akumulasi 29 butir kegiatan asuhan keperawatan milik perawat yang sudah 'verified_karu'
+  // =========================================================================
+  const [monthlyNurseReport, setMonthlyNurseReport] =
+    useState<MonthlyNurseSpoMatrixReport | null>(null);
+  const [isLoadingMonthlyCloud, setIsLoadingMonthlyCloud] = useState<boolean>(true);
+  const [monthlyCloudError, setMonthlyCloudError] = useState<string | null>(null);
+
+  const fetchMonthlyCloudData = useCallback(async () => {
+    setIsLoadingMonthlyCloud(true);
+    setMonthlyCloudError(null);
+    try {
+      if (effectiveSelectedStaff !== ALL_STAFF_KEY && activeNurseObject?.name) {
+        const report = await pasienLogbookService.getMonthlyReportByNurse(
+          activeNurseObject.name,
+          bulanTahun,
+          {
+            nipNira: activeNurseObject.nip || '-',
+            nurseRole: activeNurseObject.systemAccess || 'perawat_pelaksana',
+            headNurseName: headNurseMaster?.name || shiftInfo?.kepalaRuangan,
+            headNurseNip: headNurseMaster?.nip
+          }
+        );
+        setMonthlyNurseReport(report);
+      } else {
+        await Promise.all([
+          logbookService.getVerifiedReports(monthStartIso, monthEndIso),
+          pasienLogbookService.getVerifiedPatientReports(monthStartIso, monthEndIso)
+        ]);
+        setRefreshTick((t) => t + 1);
+      }
+    } catch (err) {
+      console.error('Gagal mengambil laporan matriks bulanan perawat dari Cloud Firestore:', err);
+      setMonthlyCloudError(
+        'Gagal memuat matriks bulanan 29 poin SPO (verified_karu) dari jaringan Cloud Firestore.'
+      );
+    } finally {
+      setIsLoadingMonthlyCloud(false);
+    }
+  }, [
+    effectiveSelectedStaff,
+    activeNurseObject,
+    bulanTahun,
+    headNurseMaster?.name,
+    headNurseMaster?.nip,
+    shiftInfo?.kepalaRuangan,
+    monthStartIso,
+    monthEndIso
+  ]);
+
+  useEffect(() => {
+    let isMounted = true;
+    void fetchMonthlyCloudData();
+
+    let unsubNurseMatrix: (() => void) | null = null;
+    let unsubUnitLogs: (() => void) | null = null;
+    let unsubUnitPatients: (() => void) | null = null;
+
+    if (effectiveSelectedStaff !== ALL_STAFF_KEY && activeNurseObject?.name) {
+      unsubNurseMatrix = pasienLogbookService.subscribeMonthlyReportByNurse(
+        activeNurseObject.name,
+        bulanTahun,
+        (report) => {
+          if (!isMounted) return;
+          setMonthlyNurseReport(report);
+          setIsLoadingMonthlyCloud(false);
+        },
+        (err) => {
+          console.error(
+            'Subscription error pasienLogbookService.subscribeMonthlyReportByNurse:',
+            err
+          );
+          if (!isMounted) return;
+          setMonthlyCloudError(
+            'Sinkronisasi real-time matriks bulanan terganggu. Klik tombol Muat Ulang.'
+          );
+          setIsLoadingMonthlyCloud(false);
+        },
+        {
+          nipNira: activeNurseObject.nip || '-',
+          nurseRole: activeNurseObject.systemAccess || 'perawat_pelaksana',
+          headNurseName: headNurseMaster?.name || shiftInfo?.kepalaRuangan,
+          headNurseNip: headNurseMaster?.nip
+        }
+      );
+    } else {
+      unsubUnitLogs = logbookService.subscribeVerifiedReports(
+        monthStartIso,
+        monthEndIso,
+        () => {
+          if (!isMounted) return;
+          setRefreshTick((t) => t + 1);
+          setIsLoadingMonthlyCloud(false);
+        }
+      );
+      unsubUnitPatients = pasienLogbookService.subscribeVerifiedPatientReports(
+        monthStartIso,
+        monthEndIso,
+        () => {
+          if (!isMounted) return;
+          setRefreshTick((t) => t + 1);
+          setIsLoadingMonthlyCloud(false);
+        }
+      );
+    }
+
+    const handleLocalUpdate = () => {
+      setRefreshTick((t) => t + 1);
+      if (effectiveSelectedStaff !== ALL_STAFF_KEY && activeNurseObject?.name) {
+        void pasienLogbookService
+          .getMonthlyReportByNurse(activeNurseObject.name, bulanTahun, {
+            nipNira: activeNurseObject.nip || '-',
+            nurseRole: activeNurseObject.systemAccess || 'perawat_pelaksana',
+            headNurseName: headNurseMaster?.name || shiftInfo?.kepalaRuangan,
+            headNurseNip: headNurseMaster?.nip
+          })
+          .then((rep) => {
+            if (isMounted) setMonthlyNurseReport(rep);
+          })
+          .catch(() => {});
+      }
+    };
+
+    window.addEventListener('logbook_records_updated', handleLocalUpdate);
+    window.addEventListener('logbook_sessions_updated', handleLocalUpdate);
+    window.addEventListener('verification_registry_updated', handleLocalUpdate);
+    window.addEventListener('storage', handleLocalUpdate);
+
+    return () => {
+      isMounted = false;
+      if (unsubNurseMatrix) unsubNurseMatrix();
+      if (unsubUnitLogs) unsubUnitLogs();
+      if (unsubUnitPatients) unsubUnitPatients();
+      window.removeEventListener('logbook_records_updated', handleLocalUpdate);
+      window.removeEventListener('logbook_sessions_updated', handleLocalUpdate);
+      window.removeEventListener('verification_registry_updated', handleLocalUpdate);
+      window.removeEventListener('storage', handleLocalUpdate);
+    };
+  }, [
+    effectiveSelectedStaff,
+    activeNurseObject,
+    bulanTahun,
+    headNurseMaster?.name,
+    headNurseMaster?.nip,
+    shiftInfo?.kepalaRuangan,
+    monthStartIso,
+    monthEndIso,
+    fetchMonthlyCloudData
+  ]);
+
+  // Compute Unit All-Staff Recap for supervisor / admin roles
   const unitRecap: UnitMonthlyRecapOverview = useMemo(() => {
     if (isPelaksana) {
       return {
@@ -209,43 +378,17 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
       targetYear: selectedYear
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPelaksana, activeNurses, shiftInfo, sessions, cloudNurseLogbooks, selectedMonth, selectedYear, currentMonthYearTitle, refreshTick]);
-
-  // Find the selected individual nurse (locked to personal nurse if Pelaksana)
-  const activeNurseObject = useMemo(() => {
-    if (!isPelaksana && effectiveSelectedStaff === ALL_STAFF_KEY) return null;
-    const targetName = isPelaksana ? personalStaffName : effectiveSelectedStaff;
-    const found = activeNurses.find((n) => isMatchingNurse(n.name, targetName));
-    if (found) return found;
-    if (isPelaksana && loggedInUser?.name) {
-      return {
-        id: 'nurse-logged-in',
-        name: loggedInUser.name,
-        nip: loggedInUser.nip || '-',
-        role: 'perawat_pelaksana',
-        systemAccess: 'perawat_pelaksana',
-        accountStatus: 'aktif'
-      } as MasterNurse;
-    }
-    return null;
-  }, [isPelaksana, effectiveSelectedStaff, personalStaffName, activeNurses, loggedInUser]);
-
-  // Compute individual staff recap for selected nurse
-  const currentRecap = useMemo(() => {
-    if (!activeNurseObject) return null;
-    return buildStaffMonthlyRecap({
-      nurseName: activeNurseObject.name,
-      nurseNip: activeNurseObject.nip || '-',
-      userRole: activeNurseObject.systemAccess || 'perawat_pelaksana',
-      shiftInfo,
-      sessions,
-      masterNurses,
-      cloudNurseLogbooks,
-      targetMonth: selectedMonth,
-      targetYear: selectedYear
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeNurseObject, shiftInfo, sessions, masterNurses, cloudNurseLogbooks, selectedMonth, selectedYear, refreshTick]);
+  }, [
+    isPelaksana,
+    activeNurses,
+    shiftInfo,
+    sessions,
+    cloudNurseLogbooks,
+    selectedMonth,
+    selectedYear,
+    currentMonthYearTitle,
+    refreshTick
+  ]);
 
   const isCurrentMonthActive =
     selectedMonth === activeParsedDate.month && selectedYear === activeParsedDate.year;
@@ -257,26 +400,22 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
 
   const [isExportingPdf, setIsExportingPdf] = useState(false);
 
-  // FUNGSI CETAK: Langsung membuka dialog cetak browser
   const handlePrint = () => {
     const isIndiv = isPelaksana || effectiveSelectedStaff !== ALL_STAFF_KEY;
     const docTitle = isIndiv
       ? `Logbook_Bulanan_${activeNurseObject?.name || 'Perawat'}_${currentMonthYearTitle}`
       : `Rekapitulasi_Bulanan_Unit_HD_${currentMonthYearTitle}`;
 
-    // If viewing an individual nurse (or Perawat Pelaksana), switch to print mode and trigger landscape print
     if (viewMode !== 'print' && isIndiv) {
       setViewMode('print');
       setTimeout(() => {
-        printDocumentWithOrientation(true, docTitle); // true = Landscape for 31-day table
+        printDocumentWithOrientation(true, docTitle);
       }, 180);
       return;
     }
-    // If already in print mode or viewing unit recap overview, trigger landscape print
     printDocumentWithOrientation(true, docTitle);
   };
 
-  // FUNGSI SIMPAN PDF: Langsung mendownload file PDF ke komputer / HP
   const handleDownloadPdf = async () => {
     const isIndiv = isPelaksana || effectiveSelectedStaff !== ALL_STAFF_KEY;
     const docTitle = isIndiv
@@ -338,49 +477,67 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
     });
   };
 
+  const isViewingIndividualMatrix = isPelaksana || effectiveSelectedStaff !== ALL_STAFF_KEY;
+
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 pb-10">
       {/* ===================================================================== */}
       {/* 1. HEADER CARD & INTEGRATED CONTROL BAR                               */}
       {/* ===================================================================== */}
-      <div className="bg-white/95 rounded-2xl border border-slate-200/90 p-4 sm:p-5 shadow-xs flex flex-col gap-4">
-        {/* Top Row: Title, Subtitle, & Primary Actions */}
+      <div className="bg-white/95 rounded-2xl border border-slate-200/90 p-4 sm:p-5 shadow-xs flex flex-col gap-4 print:hidden">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div className="space-y-1.5 min-w-0">
             <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-slate-500">
               <span className="text-[#164e78] font-bold uppercase tracking-wider">
-                Laporan Bulanan Hemodialisis
+                Laporan Bulanan Hemodialisis (29 Poin SPO)
               </span>
               <span aria-hidden="true" className="text-slate-300">&middot;</span>
-              <span>Terstandar KARS &amp; PERNEFRI</span>
+              <span>Basis Data: Disahkan Kepala Ruang (verified_karu)</span>
               <span aria-hidden="true" className="text-slate-300">&middot;</span>
               <span className="truncate">{shiftInfo?.hospitalName || 'RS Happy Land Medical Centre'}</span>
             </div>
-            
+
             <h2 className="text-lg sm:text-xl xl:text-[22px] font-black text-slate-950 tracking-tight flex items-center gap-2.5">
               <div className="w-8 h-8 rounded-xl bg-blue-50 text-[#164e78] flex items-center justify-center shrink-0 border border-blue-100">
                 <Calendar className="w-4 h-4" />
               </div>
               <span className="truncate">
-                REKAPITULASI LOGBOOK BULANAN
+                MATRIKS REKAPITULASI BULANAN (TANGGAL 1 S/D 31)
               </span>
-              <span className="hidden sm:inline-block text-xs font-bold px-2 py-0.5 rounded-md bg-blue-50 text-[#164e78] border border-blue-200/70 font-mono">
-                {currentMonthYearTitle}
+              <span className="hidden sm:inline-block text-xs font-bold text-[#164e78] font-mono">
+                &middot; {currentMonthYearTitle}
               </span>
             </h2>
 
             <p className="text-xs text-slate-600 leading-relaxed max-w-4xl">
-              {isPelaksana
-                ? 'Menampilkan matriks rekapitulasi nilai harian SPO asuhan hemodialisis pribadi Anda yang telah disahkan oleh PJ Shift atau Kepala Ruang.'
-                : 'Menampilkan data logbook SPO asuhan hemodialisis seluruh staf yang telah disahkan oleh PJ Shift atau Kepala Ruang (Akses Supervisi Staf).'}{' '}
-              &middot; Tanggal Dinas Aktif:{' '}
-              <strong className="text-[#164e78] tabular-nums font-semibold">{activeDateLabel}</strong>.
+              Melacak akumulasi 29 butir kegiatan asuhan keperawatan hemodialisis (Bagian I–VI) pada kolom tanggal 1 sampai 31 horizontal yang telah berstatus <strong>verified_karu</strong> di Cloud Firestore.{' '}
+              &middot; Periode Kode: <strong className="text-[#164e78] font-mono">{bulanTahun}</strong>
+              {isLoadingMonthlyCloud && (
+                <span className="inline-flex items-center gap-1 ml-2 text-[#164e78] font-semibold">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>Menarik data Cloud Firestore...</span>
+                </span>
+              )}
             </p>
+            {monthlyCloudError && (
+              <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 flex flex-wrap items-center justify-between gap-2 text-xs text-rose-900 mt-1">
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span className="font-semibold">{monthlyCloudError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void fetchMonthlyCloudData()}
+                  className="px-3 py-1 rounded-lg bg-rose-700 hover:bg-rose-800 text-white font-bold cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  Coba Lagi
+                </button>
+              </div>
+            )}
           </div>
 
-          {/* Action Toolbar: View Switcher, PDF Export, and Master Excel */}
+          {/* Action Toolbar */}
           <div className="flex flex-wrap items-center gap-2 self-start lg:self-center shrink-0">
-            {/* View Switcher Segmented Control */}
             <div className="inline-flex items-center bg-slate-100/90 p-1 rounded-xl border border-slate-200/80 shrink-0">
               <button
                 type="button"
@@ -393,11 +550,9 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
               >
                 <Table className="w-3.5 h-3.5 shrink-0" />
                 <span>
-                  {isPelaksana
-                    ? 'Matriks 1–31 Hari'
-                    : effectiveSelectedStaff === ALL_STAFF_KEY
+                  {effectiveSelectedStaff === ALL_STAFF_KEY
                     ? 'Rekap Unit HD'
-                    : 'Matriks 1–31 Hari'}
+                    : 'Matriks 1–31 (29 SPO)'}
                 </span>
               </button>
               <button
@@ -414,35 +569,40 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
               </button>
             </div>
 
-            {/* Tombol Cetak (Langsung Buka Dialog Print) */}
+            <button
+              type="button"
+              onClick={() => void fetchMonthlyCloudData()}
+              disabled={isLoadingMonthlyCloud}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-800 text-xs font-bold border border-slate-300 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+              title="Muat ulang data bulanan dari Cloud Firestore"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isLoadingMonthlyCloud ? 'animate-spin' : ''}`} />
+              <span>Muat Ulang</span>
+            </button>
+
             <button
               type="button"
               onClick={handlePrint}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#164e78] hover:bg-[#103b5b] active:scale-[0.99] text-white text-xs font-bold transition-all cursor-pointer shadow-xs whitespace-nowrap shrink-0"
-              title="Cetak langsung dokumen ke printer atau dialog cetak"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#164e78] hover:bg-[#103b5b] text-white text-xs font-bold transition-all cursor-pointer shadow-xs whitespace-nowrap shrink-0"
             >
               <Printer className="w-3.5 h-3.5 shrink-0" />
               <span>Cetak</span>
             </button>
 
-            {/* Tombol Simpan PDF (Langsung Unduh File PDF) */}
             <button
               type="button"
               onClick={handleDownloadPdf}
               disabled={isExportingPdf}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-700 hover:bg-rose-800 disabled:opacity-50 active:scale-[0.99] text-white text-xs font-bold transition-all cursor-pointer shadow-xs whitespace-nowrap shrink-0"
-              title="Download dokumen Rekapitulasi Bulanan langsung sebagai file .pdf"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white text-xs font-bold transition-all cursor-pointer shadow-xs whitespace-nowrap shrink-0"
             >
               <FileDown className="w-3.5 h-3.5 shrink-0" />
               <span>{isExportingPdf ? 'Mengunduh PDF...' : 'Simpan PDF'}</span>
             </button>
 
-            {/* Tombol Master Spreadsheet */}
             <button
               type="button"
               onClick={handleExportMasterSpreadsheet}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 active:scale-[0.99] text-white text-xs font-bold transition-all cursor-pointer shadow-xs whitespace-nowrap shrink-0"
-              title="Unduh 1 File Master Excel (.xlsx) komprehensif berisi seluruh Laporan Pasien, Laporan PJ Shift, dan Rekapitulasi Bulanan Perawat"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold transition-all cursor-pointer shadow-xs whitespace-nowrap shrink-0"
             >
               <FileSpreadsheet className="w-3.5 h-3.5 shrink-0" />
               <span>Master Excel (.xlsx)</span>
@@ -450,28 +610,29 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
           </div>
         </div>
 
-        {/* Bottom Row: Staff Selector & Period Filter Bar */}
+        {/* Bottom Row: Staff Selector & Month/Year Filter Bar */}
         <div className="pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3 bg-slate-50/80 rounded-xl p-3 border border-slate-200/70">
           <div className="flex flex-wrap items-center gap-3 w-full md:w-auto">
-            {/* Staff Selector */}
             {isPelaksana ? (
               <div className="flex items-center gap-2">
                 <span className="text-xs font-bold text-slate-700 flex items-center gap-1.5 shrink-0">
                   <UserCheck className="w-3.5 h-3.5 text-[#164e78]" />
-                  <span>Staf Logbook:</span>
+                  <span>Nama Perawat:</span>
                 </span>
                 <div className="bg-white border border-blue-200 text-slate-900 font-bold text-xs rounded-lg px-3 py-1.5 flex items-center gap-2 shadow-2xs">
                   <span className="text-[#164e78] font-bold">{personalStaffName}</span>
-                  <span className="text-[10.5px] font-semibold text-blue-700 bg-blue-50/80 px-2 py-0.5 rounded border border-blue-200/60">
-                    Akun Mandiri
-                  </span>
+                  <span aria-hidden="true" className="text-slate-300">&middot;</span>
+                  <span className="text-[11px] font-medium text-slate-600">Akun Mandiri</span>
                 </div>
               </div>
             ) : (
               <div className="flex items-center gap-2 min-w-[280px] flex-1 sm:flex-initial">
-                <label htmlFor="select-staff" className="text-xs font-bold text-slate-700 flex items-center gap-1.5 shrink-0">
+                <label
+                  htmlFor="select-staff"
+                  className="text-xs font-bold text-slate-700 flex items-center gap-1.5 shrink-0"
+                >
                   <UserCheck className="w-3.5 h-3.5 text-[#164e78]" />
-                  <span>Pilih Staf:</span>
+                  <span>Pilih Perawat:</span>
                 </label>
                 <select
                   id="select-staff"
@@ -482,12 +643,11 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
                   }}
                   className="bg-white border border-slate-300 text-slate-900 font-semibold text-xs rounded-lg px-3 py-1.5 focus:ring-2 focus:ring-[#164e78]/30 focus:border-[#164e78] focus:outline-hidden w-full cursor-pointer shadow-2xs transition-all"
                 >
-                  <option value={ALL_STAFF_KEY}>
-                    📊 Rekapitulasi Seluruh Staf (Unit Hemodialisis)
-                  </option>
-                  <optgroup label="─── DAFTAR PERAWAT PELAKSANA &amp; PJ SHIFT ───">
+                  <optgroup label="Matriks 1–31 Perawat (29 Poin SPO verified_karu)">
                     {activeNurses.map((nurse) => {
-                      const nurseRecap = unitRecap.staffSummaries.find((s) => s.nurseName === nurse.name);
+                      const nurseRecap = unitRecap.staffSummaries.find(
+                        (s) => s.nurseName === nurse.name
+                      );
                       const verifiedDays = nurseRecap?.verifiedDaysCount || 0;
                       const verifiedPats = nurseRecap?.totalVerifiedPatients || 0;
                       const roleTag =
@@ -503,26 +663,30 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
                       );
                     })}
                   </optgroup>
+                  <optgroup label="Ringkasan Unit">
+                    <option value={ALL_STAFF_KEY}>
+                      Rekapitulasi Seluruh Staf (Unit Hemodialisis)
+                    </option>
+                  </optgroup>
                 </select>
               </div>
             )}
 
-            {/* Quick Switch Button if supervisor is viewing an individual nurse */}
             {!isPelaksana && selectedStaff !== ALL_STAFF_KEY && (
               <button
                 type="button"
                 onClick={() => setSelectedStaff(ALL_STAFF_KEY)}
-                className="text-xs font-bold text-[#164e78] hover:text-[#0e3553] bg-blue-50/80 hover:bg-blue-100/80 border border-blue-200/80 px-2.5 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer shrink-0"
+                className="text-xs font-bold text-[#164e78] hover:text-[#0e3553] bg-blue-50/80 hover:bg-blue-100/80 border border-blue-200/80 px-2.5 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
               >
                 <Users className="w-3.5 h-3.5" />
-                <span>Lihat Semua Staf</span>
+                <span>Rekap Semua Staf</span>
               </button>
             )}
           </div>
 
-          {/* Month & Year Filter */}
+          {/* Month & Year Filter (Memicu getMonthlyReportByNurse(namaPerawat, bulanTahun)) */}
           <div className="flex flex-wrap items-center gap-2">
-            <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-lg px-2.5 py-1 shadow-2xs">
+            <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-lg px-2.5 py-1 shadow-2xs tabular-nums">
               <Filter className="w-3.5 h-3.5 text-slate-400 shrink-0" />
               <select
                 aria-label="Pilih Bulan Rekapitulasi"
@@ -554,7 +718,7 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
                 type="button"
                 onClick={handleResetToCurrentMonth}
                 title="Kembali ke bulan berjalan saat ini"
-                className="text-xs font-semibold text-slate-700 hover:text-[#164e78] bg-white hover:bg-slate-50 border border-slate-300 px-2.5 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer shadow-2xs"
+                className="text-xs font-semibold text-slate-700 hover:text-[#164e78] bg-white hover:bg-slate-50 border border-slate-300 px-2.5 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer shadow-2xs whitespace-nowrap shrink-0"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
                 <span>Bulan Ini</span>
@@ -565,19 +729,19 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
       </div>
 
       {/* ===================================================================== */}
-      {/* 2. VIEW 1: REKAPITULASI SELURUH STAF (UNIT OVERVIEW)                   */}
+      {/* 2. VIEW UNIT OVERVIEW (OPSIONAL JIKA SUPERVISOR MEMILIH SEMUA STAF)    */}
       {/* ===================================================================== */}
       {!isPelaksana && effectiveSelectedStaff === ALL_STAFF_KEY && (
         <div className="space-y-4">
-          {/* Unit KPI Metric Summary Cards */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5 tabular-nums">
-            <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs transition-all hover:border-slate-300">
+            <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs">
               <div className="min-w-0">
                 <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
                   Total Tenaga Perawat
                 </div>
                 <div className="text-xl sm:text-2xl font-black text-slate-900 mt-1 font-mono">
-                  {unitRecap.totalActiveNurses} <span className="text-xs font-semibold text-slate-500 font-sans">Orang</span>
+                  {unitRecap.totalActiveNurses}{' '}
+                  <span className="text-xs font-semibold text-slate-500 font-sans">Orang</span>
                 </div>
                 <div className="text-[11px] text-slate-500 truncate mt-0.5">
                   Unit Dialisis &middot; Terjadwal
@@ -588,13 +752,14 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
               </div>
             </div>
 
-            <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs transition-all hover:border-slate-300">
+            <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs">
               <div className="min-w-0">
                 <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
                   Hari Dinas Disahkan
                 </div>
                 <div className="text-xl sm:text-2xl font-black text-slate-900 mt-1 font-mono">
-                  {unitRecap.totalVerifiedDutyDays} <span className="text-xs font-semibold text-slate-500 font-sans">Hari Kerja</span>
+                  {unitRecap.totalVerifiedDutyDays}{' '}
+                  <span className="text-xs font-semibold text-slate-500 font-sans">Hari Kerja</span>
                 </div>
                 <div className="text-[11px] text-[#164e78] font-semibold truncate mt-0.5">
                   Periode {unitRecap.monthYear}
@@ -605,16 +770,17 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
               </div>
             </div>
 
-            <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs transition-all hover:border-slate-300">
+            <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs">
               <div className="min-w-0">
                 <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
                   Pasien HD Terverifikasi
                 </div>
                 <div className="text-xl sm:text-2xl font-black text-slate-900 mt-1 font-mono">
-                  {unitRecap.totalVerifiedPatientsUnit} <span className="text-xs font-semibold text-slate-500 font-sans">Pasien</span>
+                  {unitRecap.totalVerifiedPatientsUnit}{' '}
+                  <span className="text-xs font-semibold text-slate-500 font-sans">Pasien</span>
                 </div>
                 <div className="text-[11px] text-emerald-700 font-semibold truncate mt-0.5">
-                  Disahkan PJ Shift &amp; KaRu
+                  Disahkan Kepala Ruang (verified_karu)
                 </div>
               </div>
               <div className="w-11 h-11 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center shrink-0 border border-emerald-100">
@@ -622,7 +788,7 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
               </div>
             </div>
 
-            <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs transition-all hover:border-slate-300">
+            <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs">
               <div className="min-w-0">
                 <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
                   Kepatuhan SPO Unit HD
@@ -640,25 +806,10 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
             </div>
           </div>
 
-          {/* Unit Staff Table Container */}
           <div
             id="printable-unit-recap"
             className="printable-sheet bg-white rounded-2xl border border-slate-200/90 shadow-xs overflow-hidden print:border-none print:shadow-none print:rounded-none"
           >
-            {/* Dedicated Official Print Header (Visible only on print/PDF) */}
-            <div className="hidden print:block text-center border-b-2 border-slate-900 pb-2 mb-3">
-              <div className="text-[11px] font-bold tracking-wider text-slate-700 uppercase">
-                {shiftInfo?.hospitalName || 'RS HAPPY LAND MEDICAL CENTRE'} &bull; UNIT PELAYANAN HEMODIALISIS
-              </div>
-              <h1 className="text-[14px] font-black tracking-tight text-slate-950 uppercase mt-0.5">
-                REKAPITULASI BULANAN CAPAIAN LOGBOOK ASUHAN KEPERAWATAN HEMODIALISIS
-              </h1>
-              <div className="text-[9.5px] text-slate-600 mt-0.5">
-                Periode: <strong>{unitRecap.monthYear}</strong> &bull; Total {unitRecap.totalActiveNurses} Tenaga Perawat &bull; {unitRecap.totalVerifiedPatientsUnit} Pasien Disahkan &bull; Rata-rata Kepatuhan: {unitRecap.unitOverallCompliancePct}% &bull; Standar Akreditasi KARS &amp; PERNEFRI
-              </div>
-            </div>
-
-            {/* Table Header Bar */}
             <div className="px-5 py-4 bg-slate-50/90 border-b border-slate-200/80 flex flex-wrap items-center justify-between gap-3 print:hidden">
               <div>
                 <h3 className="text-sm font-bold text-slate-950 flex items-center gap-2">
@@ -666,46 +817,13 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
                   <span>Daftar Rekapitulasi Capaian Logbook Seluruh Perawat ({unitRecap.monthYear})</span>
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Akumulasi nilai SPO otomatis terhitung dari logbook harian perawat pelaksana yang telah disahkan oleh PJ Shift atau Kepala Ruang.
+                  Klik tombol Buka Matriks pada baris perawat untuk membuka tabel matriks 1–31 horizontal (29 Poin SPO).
                 </p>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={handlePrint}
-                  className="px-3.5 py-1.5 bg-[#164e78] hover:bg-[#103b5b] text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-xs whitespace-nowrap"
-                  title="Cetak Rekapitulasi Unit langsung"
-                >
-                  <Printer className="w-3.5 h-3.5 shrink-0" />
-                  <span>Cetak</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDownloadPdf}
-                  disabled={isExportingPdf}
-                  className="px-3.5 py-1.5 bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-xs whitespace-nowrap"
-                  title="Download file PDF Rekapitulasi Unit"
-                >
-                  <FileDown className="w-3.5 h-3.5 shrink-0" />
-                  <span>{isExportingPdf ? 'Mengunduh...' : 'Simpan PDF'}</span>
-                </button>
-                {canVerifyLogbook(userRole) && onNavigateToVerifikasi && (
-                  <button
-                    type="button"
-                    onClick={onNavigateToVerifikasi}
-                    className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200/80 rounded-xl text-xs font-semibold transition-colors flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <ShieldCheck className="w-3.5 h-3.5 text-indigo-600" />
-                    <span>Buka Verifikasi Logbook</span>
-                  </button>
-                )}
               </div>
             </div>
 
-            {/* Table */}
             <div className="overflow-x-auto scrollbar-thin">
-              <table className="w-full text-left text-xs border-collapse print:text-[8px] print:leading-tight">
+              <table className="w-full text-left text-xs border-collapse tabular-nums">
                 <thead>
                   <tr className="bg-[#164e78] text-white font-bold text-center text-[11px] uppercase tracking-wider">
                     <th className="p-3 border-r border-[#1e5d8e] w-12 text-center">NO</th>
@@ -713,11 +831,9 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
                     <th className="p-3 border-r border-[#1e5d8e] w-36 text-center">JABATAN</th>
                     <th className="p-3 border-r border-[#1e5d8e] w-28 text-center">HARI DISAHKAN</th>
                     <th className="p-3 border-r border-[#1e5d8e] w-32 text-center">PASIEN KELOLAAN</th>
-                    <th className="p-3 border-r border-[#1e5d8e] w-28 text-center">AKSESING (3.6)</th>
                     <th className="p-3 border-r border-[#1e5d8e] w-32 text-center">NILAI SPO / MAKS</th>
                     <th className="p-3 border-r border-[#1e5d8e] w-28 text-center">% CAPAIAN</th>
-                    <th className="p-3 border-r border-[#1e5d8e] w-44 text-left">STATUS &amp; VERIFIKATOR</th>
-                    <th className="p-3 w-32 text-center print:hidden">AKSI</th>
+                    <th className="p-3 w-36 text-center print:hidden">AKSI</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200 text-slate-800">
@@ -726,7 +842,11 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
                     return (
                       <tr
                         key={staff.nurseId || idx}
-                        className={idx % 2 === 1 ? 'bg-slate-50/60 hover:bg-blue-50/50 transition-colors' : 'bg-white hover:bg-blue-50/50 transition-colors'}
+                        className={
+                          idx % 2 === 1
+                            ? 'bg-slate-50/60 hover:bg-blue-50/50 transition-colors'
+                            : 'bg-white hover:bg-blue-50/50 transition-colors'
+                        }
                       >
                         <td className="p-3 text-center font-mono text-slate-500 font-semibold border-r border-slate-200">
                           {idx + 1}
@@ -735,88 +855,24 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
                           <div className="font-bold text-slate-950 text-xs">{staff.nurseName}</div>
                           <div className="text-[11px] text-slate-500 font-mono mt-0.5">NIP: {staff.nurseNip}</div>
                         </td>
-                        <td className="p-3 text-center border-r border-slate-200">
-                          <span
-                            className={`inline-block px-2.5 py-0.5 rounded-md text-[10.5px] font-bold ${
-                              staff.role === 'kepala_ruangan'
-                                ? 'bg-amber-50 text-amber-900 border border-amber-200'
-                                : staff.role === 'pj_shift'
-                                ? 'bg-indigo-50 text-indigo-900 border border-indigo-200'
-                                : 'bg-blue-50 text-blue-900 border border-blue-200'
-                            }`}
-                          >
-                            {staff.role === 'kepala_ruangan'
-                              ? 'Kepala Ruangan'
-                              : staff.role === 'pj_shift'
-                              ? 'PJ Shift'
-                              : 'Perawat Pelaksana'}
-                          </span>
+                        <td className="p-3 text-center border-r border-slate-200 font-semibold text-slate-700">
+                          {staff.role === 'kepala_ruangan'
+                            ? 'Kepala Ruangan'
+                            : staff.role === 'pj_shift'
+                            ? 'PJ Shift'
+                            : 'Perawat Pelaksana'}
                         </td>
                         <td className="p-3 text-center font-mono font-bold text-slate-900 border-r border-slate-200">
-                          {hasVerified ? (
-                            <span className="text-[#164e78] bg-blue-50/80 px-2 py-0.5 rounded-md font-black">
-                              {staff.verifiedDaysCount} Hari
-                            </span>
-                          ) : (
-                            <span className="text-slate-400 font-normal">0 Hari</span>
-                          )}
+                          {hasVerified ? `${staff.verifiedDaysCount} Hari` : '0 Hari'}
                         </td>
                         <td className="p-3 text-center font-mono font-bold text-slate-900 border-r border-slate-200">
-                          {hasVerified ? (
-                            <span className="text-emerald-800 bg-emerald-50/80 px-2 py-0.5 rounded-md font-black">
-                              {staff.totalVerifiedPatients} Pasien
-                            </span>
-                          ) : (
-                            <span className="text-slate-400 font-normal">0 Pasien</span>
-                          )}
-                        </td>
-                        <td className="p-3 text-center font-mono text-slate-700 border-r border-slate-200">
-                          {staff.poin3_6VascularCount > 0 ? (
-                            <span className="text-indigo-800 font-bold">{staff.poin3_6VascularCount}x Akses</span>
-                          ) : (
-                            <span className="text-slate-400">-</span>
-                          )}
+                          {hasVerified ? `${staff.totalVerifiedPatients} Pasien` : '0 Pasien'}
                         </td>
                         <td className="p-3 text-center font-mono border-r border-slate-200">
-                          {hasVerified ? (
-                            <span className="text-slate-900 font-bold">
-                              {staff.grandTotalScore} / {staff.grandMaxScore}
-                            </span>
-                          ) : (
-                            <span className="text-slate-400">-</span>
-                          )}
+                          {hasVerified ? `${staff.grandTotalScore} / ${staff.grandMaxScore}` : '-'}
                         </td>
                         <td className="p-3 text-center font-mono font-bold border-r border-slate-200">
-                          {hasVerified ? (
-                            <span
-                              className={`px-2.5 py-0.5 rounded-md text-[11px] font-black ${
-                                staff.overallCompliancePct >= 90
-                                  ? 'bg-emerald-100/80 text-emerald-900'
-                                  : staff.overallCompliancePct >= 75
-                                  ? 'bg-amber-100/80 text-amber-900'
-                                  : 'bg-rose-100/80 text-rose-900'
-                              }`}
-                            >
-                              {staff.overallCompliancePct}%
-                            </span>
-                          ) : (
-                            <span className="text-slate-400 font-normal">-</span>
-                          )}
-                        </td>
-                        <td className="p-3 text-left border-r border-slate-200 text-[11px]">
-                          {hasVerified ? (
-                            <div>
-                              <div className="font-bold text-emerald-700 flex items-center gap-1">
-                                <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                                <span>Disahkan</span>
-                              </div>
-                              <div className="text-slate-500 text-[10.5px] truncate mt-0.5" title={staff.lastVerifiedBy}>
-                                Oleh: {staff.lastVerifiedBy || 'PJ Shift'}
-                              </div>
-                            </div>
-                          ) : (
-                            <div className="text-slate-400 italic text-[11px]">Belum Ada Pengesahan</div>
-                          )}
+                          {hasVerified ? `${staff.overallCompliancePct}%` : '-'}
                         </td>
                         <td className="p-3 text-center print:hidden">
                           <button
@@ -825,9 +881,9 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
                               setSelectedStaff(staff.nurseName);
                               setViewMode('matrix');
                             }}
-                            className="px-3 py-1.5 bg-[#164e78] hover:bg-[#103b5b] text-white rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1.5 w-full cursor-pointer shadow-2xs"
+                            className="px-3 py-1.5 bg-[#164e78] hover:bg-[#103b5b] text-white rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-1.5 w-full cursor-pointer shadow-2xs whitespace-nowrap"
                           >
-                            <span>Buka Matriks</span>
+                            <span>Buka Matriks 1–31</span>
                             <ArrowRight className="w-3.5 h-3.5 shrink-0" />
                           </button>
                         </td>
@@ -837,533 +893,499 @@ export const LapBulananView: React.FC<LapBulananViewProps> = ({
                 </tbody>
               </table>
             </div>
-
-            {/* Official Verification Signatures Block (Visible on print/PDF) */}
-            <div className="hidden print:grid grid-cols-2 gap-8 text-center text-[10px] mt-6 pt-4 border-t border-slate-300">
-              <div>
-                <p className="text-slate-600">Mengetahui &amp; Memverifikasi,</p>
-                <p className="font-bold text-slate-900">Penanggung Jawab Shift HD</p>
-                <div className="h-12 flex items-end justify-center font-mono text-[9px] text-slate-700">
-                  ✓ Terverifikasi Digital
-                </div>
-                <p className="font-extrabold underline text-slate-950 mt-1">
-                  {shiftInfo?.pjShift || 'M. Haikal Malilang, A.Md. Kep.'}
-                </p>
-                <p className="text-[9px] text-slate-500">PJ Shift Unit Hemodialisis</p>
-              </div>
-              <div>
-                <p className="text-slate-600">Mengesahkan,</p>
-                <p className="font-bold text-slate-900">Kepala Ruangan Hemodialisis</p>
-                <div className="h-12 flex items-end justify-center font-mono text-[9px] text-slate-700">
-                  ✓ Disahkan Ka. Ruangan
-                </div>
-                <p className="font-extrabold underline text-slate-950 mt-1">
-                  {shiftInfo?.kepalaRuangan || 'Twis Fertilianti PW., S.Kep., Ns.'}
-                </p>
-                <p className="text-[9px] text-slate-500">Kepala Ruangan Unit Hemodialisis</p>
-              </div>
-            </div>
           </div>
         </div>
       )}
 
       {/* ===================================================================== */}
-      {/* 3. VIEW 2: INDIVIDUAL STAFF RECAP (MATRIKS 1–31 ATAU FORMAT CETAK)    */}
+      {/* 3. MATRIKS HORIZONTAL TANGGAL 1 S/D 31 (29 POIN KEGIATAN SPO)         */}
+      {/* Hasil pemetaan pasienLogbookService.getMonthlyReportByNurse(...)      */}
       {/* ===================================================================== */}
-      {(isPelaksana || effectiveSelectedStaff !== ALL_STAFF_KEY) && currentRecap && (
+      {isViewingIndividualMatrix && (
         <div className="space-y-4">
-          {/* Individual Nurse KPI Metric Summary Cards */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5 tabular-nums">
-            <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs">
-              <div className="min-w-0">
-                <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                  {isPelaksana ? 'Perawat Pelaksana' : 'Staf Terpilih'}
-                </div>
-                <div className="text-base sm:text-lg font-black text-slate-950 mt-1 truncate">
-                  {currentRecap.logbook.nurseName}
-                </div>
-                <div className="text-[11.5px] text-slate-500 truncate mt-0.5">
-                  {currentRecap.roleLabel} &middot; NIP: {currentRecap.logbook.nipNira}
-                </div>
+          {isLoadingMonthlyCloud && !monthlyNurseReport ? (
+            /* Loading Skeleton State saat menarik matriks 1-31 dari Cloud Firestore */
+            <div className="space-y-4 animate-pulse print:hidden">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+                {Array.from({ length: 4 }).map((_, i) => (
+                  <div key={i} className="bg-white p-4 rounded-xl border border-slate-200 h-24" />
+                ))}
               </div>
-              <div className="w-11 h-11 rounded-xl bg-indigo-50 text-indigo-700 flex items-center justify-center shrink-0 border border-indigo-100">
-                <UserCheck className="w-5 h-5" />
+              <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-3">
+                <div className="h-5 w-80 bg-slate-200 rounded" />
+                {Array.from({ length: 8 }).map((_, rIdx) => (
+                  <div key={rIdx} className="h-7 bg-slate-100 rounded" />
+                ))}
               </div>
             </div>
-
-            <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs">
-              <div className="min-w-0">
-                <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                  Hari Dinas Disahkan
-                </div>
-                <div className="text-xl sm:text-2xl font-black text-slate-900 mt-1 font-mono">
-                  {currentRecap.verifiedDaysCount} <span className="text-xs font-semibold text-slate-500 font-sans">Hari</span>
-                </div>
-                <div className="text-[11.5px] text-[#164e78] font-semibold truncate mt-0.5">
-                  Periode {currentRecap.logbook.monthYear}
-                </div>
-              </div>
-              <div className="w-11 h-11 rounded-xl bg-blue-50 text-[#164e78] flex items-center justify-center shrink-0 border border-blue-100">
-                <Calendar className="w-5 h-5" />
-              </div>
-            </div>
-
-            <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs">
-              <div className="min-w-0">
-                <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                  Pasien Kelolaan Disahkan
-                </div>
-                <div className="text-xl sm:text-2xl font-black text-slate-900 mt-1 font-mono">
-                  {currentRecap.totalVerifiedPatientsInMonth} <span className="text-xs font-semibold text-slate-500 font-sans">Pasien</span>
-                </div>
-                <div className="text-[11.5px] text-emerald-700 font-semibold truncate mt-0.5">
-                  Disahkan PJ Shift &amp; KaRu
-                </div>
-              </div>
-              <div className="w-11 h-11 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center shrink-0 border border-emerald-100">
-                <Users className="w-5 h-5" />
-              </div>
-            </div>
-
-            <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs">
-              <div className="min-w-0">
-                <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
-                  Capaian Kepatuhan SPO
-                </div>
-                <div className="text-xl sm:text-2xl font-black text-emerald-800 mt-1 font-mono">
-                  {currentRecap.overallCompliancePct}%
-                </div>
-                <div className="text-[11.5px] text-slate-500 font-mono truncate mt-0.5">
-                  Nilai: {currentRecap.grandTotalScore} / {currentRecap.grandMaxScore}
-                </div>
-              </div>
-              <div className="w-11 h-11 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center shrink-0 border border-emerald-100">
-                <Award className="w-5 h-5" />
-              </div>
-            </div>
-          </div>
-
-          {/* INFORMATIONAL EMPTY STATE IF NO VERIFIED DAYS IN THIS MONTH */}
-          {currentRecap.verifiedDaysCount === 0 && (
-            <div className="bg-white rounded-2xl border border-amber-200 bg-amber-50/40 p-5 shadow-xs space-y-3">
-              <div className="flex items-start gap-3.5">
-                <div className="w-10 h-10 rounded-xl bg-amber-100 text-amber-800 flex items-center justify-center shrink-0 mt-0.5 border border-amber-200">
-                  <AlertCircle className="w-5 h-5" />
-                </div>
-                <div className="space-y-1.5 flex-1">
-                  <h3 className="text-sm font-bold text-amber-950">
-                    {isPelaksana
-                      ? `Belum Ada Logbook Terverifikasi untuk Anda pada Periode ${currentMonthYearTitle}`
-                      : `Belum Ada Logbook Terverifikasi untuk ${currentRecap.logbook.nurseName} pada Periode ${currentMonthYearTitle}`}
-                  </h3>
-                  <p className="text-xs text-amber-900/90 leading-relaxed">
-                    {isPelaksana
-                      ? 'Matriks rekapitulasi nilai harian Anda bersumber dari asuhan pasien dan checklist SPO harian yang telah disahkan oleh PJ Shift atau Kepala Ruangan.'
-                      : 'Halaman Laporan Bulanan ini menampilkan nilai harian SPO yang bersumber dari asuhan hemodialisa perawat yang telah disahkan oleh PJ Shift atau Kepala Ruangan.'}
-                  </p>
-                  <div className="text-xs text-slate-700 space-y-1 pt-1.5">
-                    <div className="font-bold text-slate-800">Alur Pengisian &amp; Verifikasi SPO:</div>
-                    <ol className="list-decimal list-inside space-y-0.5 text-slate-600 pl-1">
-                      <li>
-                        Perawat pelaksana menginput pasien dan checklist asuhan (Bagian I–VI) di tab <strong>LOGBOOK</strong>, lalu klik <strong>Ajukan Verifikasi</strong>.
-                      </li>
-                      <li>
-                        PJ Shift atau Kepala Ruang membuka tab <strong>VERIFIKASI</strong> untuk memeriksa dan mengesahkan logbook tersebut.
-                      </li>
-                      <li>
-                        Setelah diverifikasi, tabel matriks 1–31 di bawah ini otomatis terisi dengan nilai SPO harian dan rekapitulasi capaian bulanan.
-                      </li>
-                    </ol>
-                  </div>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-amber-200/70">
-                {!isPelaksana && (
-                  <button
-                    type="button"
-                    onClick={() => setSelectedStaff(ALL_STAFF_KEY)}
-                    className="px-3.5 py-1.5 bg-[#164e78] hover:bg-[#103b5b] text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-xs"
-                  >
-                    <Users className="w-3.5 h-3.5" />
-                    <span>Lihat Rekap Seluruh Staf Unit HD</span>
-                  </button>
-                )}
-
-                {canVerifyLogbook(userRole) && onNavigateToVerifikasi && (
-                  <button
-                    type="button"
-                    onClick={onNavigateToVerifikasi}
-                    className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-xs"
-                  >
-                    <ShieldCheck className="w-3.5 h-3.5" />
-                    <span>Buka Halaman Verifikasi Logbook</span>
-                  </button>
-                )}
-
-                {onNavigateToLogbook && (
-                  <button
-                    type="button"
-                    onClick={onNavigateToLogbook}
-                    className="px-3.5 py-1.5 bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer shadow-2xs"
-                  >
-                    <FileText className="w-3.5 h-3.5 text-slate-500" />
-                    <span>Buka Logbook Pelaksana</span>
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* VIEW SWITCHER CONTENT: PRINT vs MATRIX */}
-          {viewMode === 'print' ? (
-            <OfficialPelaksanaLogbookPrintable logbook={currentRecap.logbook} />
-          ) : (
+          ) : monthlyNurseReport ? (
             <>
-              {/* Sedia lembar cetak resmi untuk window.print() langsung dari tampilan matriks */}
-              <div className="hidden print:block">
-                <OfficialPelaksanaLogbookPrintable logbook={currentRecap.logbook} />
-              </div>
-
-              {/* Full Monthly Matrix 1-31 Table Container */}
-              <div className="bg-white rounded-2xl border border-slate-200/90 shadow-xs overflow-hidden print:hidden">
-                {/* Table Header Bar */}
-                <div className="px-5 py-3.5 bg-slate-50/90 border-b border-slate-200/80 flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <h3 className="text-sm font-bold text-slate-950 flex items-center gap-2">
-                      <Table className="w-4 h-4 text-[#164e78]" />
-                      <span>Matriks Rekapitulasi Nilai Harian Tanggal 1 s/d 31 ({currentRecap.logbook.monthYear})</span>
-                    </h3>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      {isPelaksana ? (
-                        <span>
-                          Menampilkan nilai SPO harian pribadi Anda &middot; Angka pada kolom tanggal menunjukkan nilai capaian terverifikasi per poin SPO.
-                        </span>
-                      ) : (
-                        <span>
-                          Menampilkan nilai SPO perawat <strong>{currentRecap.logbook.nurseName}</strong> &middot; Angka pada kolom tanggal menunjukkan nilai capaian terverifikasi per poin SPO.
-                        </span>
-                      )}
-                    </p>
+              {/* Individual Nurse KPI Metric Summary Cards */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5 tabular-nums print:hidden">
+                <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs">
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                      Perawat Pelaksana Asuhan
+                    </div>
+                    <div className="text-base sm:text-lg font-black text-slate-950 mt-1 truncate">
+                      {monthlyNurseReport.logbook.nurseName}
+                    </div>
+                    <div className="text-[11.5px] text-slate-500 truncate mt-0.5">
+                      {monthlyNurseReport.roleLabel} &middot; NIP: {monthlyNurseReport.logbook.nipNira}
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => setViewMode('print')}
-                      className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300/80 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
-                    >
-                      <Table className="w-3.5 h-3.5 shrink-0 text-slate-500" />
-                      <span>Format Cetak A4</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handlePrint}
-                      className="px-3 py-1.5 bg-[#164e78] hover:bg-[#103b5b] text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shadow-xs"
-                      title="Buka dialog cetak browser langsung"
-                    >
-                      <Printer className="w-3.5 h-3.5 shrink-0" />
-                      <span>Cetak</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleDownloadPdf}
-                      disabled={isExportingPdf}
-                      className="px-3 py-1.5 bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shadow-xs"
-                      title="Download file PDF logbook langsung"
-                    >
-                      <FileDown className="w-3.5 h-3.5 shrink-0" />
-                      <span>{isExportingPdf ? 'Mengunduh...' : 'Simpan PDF'}</span>
-                    </button>
+                  <div className="w-11 h-11 rounded-xl bg-indigo-50 text-indigo-700 flex items-center justify-center shrink-0 border border-indigo-100">
+                    <UserCheck className="w-5 h-5" />
                   </div>
                 </div>
 
-                {/* 31-Day Matrix Table with Precise Sticky Offsets */}
-                <div className="overflow-x-auto max-h-[720px] relative scrollbar-thin">
-                  <table className="w-full text-left text-xs border-collapse tabular-nums">
-                    <thead className="sticky top-0 z-20 shadow-xs">
-                      {/* Row 1 Header */}
-                      <tr className="bg-[#164e78] text-white font-bold text-center text-[10.5px]">
-                        <th
-                          rowSpan={2}
-                          className="p-2 border-r border-[#1e5d8e] w-[52px] min-w-[52px] max-w-[52px] sticky left-0 z-30 bg-[#164e78] text-center"
-                        >
-                          POIN
-                        </th>
-                        <th
-                          rowSpan={2}
-                          className="p-2 border-r border-[#1e5d8e] w-[130px] min-w-[130px] max-w-[130px] text-left sticky left-[52px] z-30 bg-[#164e78]"
-                        >
-                          FASE ASUHAN
-                        </th>
-                        <th
-                          rowSpan={2}
-                          className="p-2 border-r border-[#1e5d8e] min-w-[240px] text-left bg-[#164e78]"
-                        >
-                          URAIAN KEGIATAN SPESIFIK SPO
-                        </th>
-                        <th
-                          colSpan={31}
-                          className="p-1.5 border-b border-[#1e5d8e] text-[10px] uppercase font-bold tracking-wider bg-[#1a5b8c] text-white"
-                        >
-                          NILAI HARIAN TERVERIFIKASI — BULAN {currentRecap.logbook.monthYear.toUpperCase()}
-                        </th>
-                        <th rowSpan={2} className="p-2 border-l border-[#1e5d8e] w-[56px] min-w-[56px] text-center bg-[#164e78]">
-                          TOTAL
-                        </th>
-                        <th rowSpan={2} className="p-2 border-l border-[#1e5d8e] w-[56px] min-w-[56px] text-center bg-[#164e78]">
-                          MAKS
-                        </th>
-                        <th rowSpan={2} className="p-2 border-l border-[#1e5d8e] w-[56px] min-w-[56px] text-center bg-[#164e78]">
-                          %
-                        </th>
-                      </tr>
+                <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs">
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                      Hari Dinas (verified_karu)
+                    </div>
+                    <div className="text-xl sm:text-2xl font-black text-slate-900 mt-1 font-mono">
+                      {monthlyNurseReport.verifiedDaysCount}{' '}
+                      <span className="text-xs font-semibold text-slate-500 font-sans">Hari</span>
+                    </div>
+                    <div className="text-[11.5px] text-[#164e78] font-semibold truncate mt-0.5">
+                      Periode {monthlyNurseReport.logbook.monthYear}
+                    </div>
+                  </div>
+                  <div className="w-11 h-11 rounded-xl bg-blue-50 text-[#164e78] flex items-center justify-center shrink-0 border border-blue-100">
+                    <Calendar className="w-5 h-5" />
+                  </div>
+                </div>
 
-                      {/* Row 2: Days 1 to 31 */}
-                      <tr className="bg-[#1a5b8c] text-white font-bold text-[9.5px] text-center">
-                        {daysArray.map((day, idx) => {
-                          const isOutOfMonth = day > currentRecap.daysInMonth;
-                          const isActiveDay = !isOutOfMonth && day === activeParsedDate.day && isCurrentMonthActive;
-                          const isVerifiedDay = !isOutOfMonth && Boolean(currentRecap.logbook.verifiedDays?.[idx]);
-                          return (
+                <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs">
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                      Pasien Disahkan Ka. Ruang
+                    </div>
+                    <div className="text-xl sm:text-2xl font-black text-slate-900 mt-1 font-mono">
+                      {monthlyNurseReport.totalVerifiedPatientsInMonth}{' '}
+                      <span className="text-xs font-semibold text-slate-500 font-sans">Pasien</span>
+                    </div>
+                    <div className="text-[11.5px] text-emerald-700 font-semibold truncate mt-0.5">
+                      Status: verified_karu
+                    </div>
+                  </div>
+                  <div className="w-11 h-11 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center shrink-0 border border-emerald-100">
+                    <Users className="w-5 h-5" />
+                  </div>
+                </div>
+
+                <div className="bg-white p-4 rounded-xl border border-slate-200/90 flex items-center justify-between gap-3 shadow-xs">
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                      Akumulasi 29 Poin SPO
+                    </div>
+                    <div className="text-xl sm:text-2xl font-black text-emerald-800 mt-1 font-mono">
+                      {monthlyNurseReport.overallCompliancePct}%
+                    </div>
+                    <div className="text-[11.5px] text-slate-500 font-mono truncate mt-0.5">
+                      Nilai: {monthlyNurseReport.grandTotalScore} / {monthlyNurseReport.grandMaxScore}
+                    </div>
+                  </div>
+                  <div className="w-11 h-11 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center shrink-0 border border-emerald-100">
+                    <Award className="w-5 h-5" />
+                  </div>
+                </div>
+              </div>
+
+              {/* Informational Banner if No verified_karu Days in This Month */}
+              {monthlyNurseReport.verifiedDaysCount === 0 && !isLoadingMonthlyCloud && (
+                <div className="bg-amber-50/60 rounded-2xl border border-amber-200 p-4 sm:p-5 shadow-2xs space-y-3 print:hidden">
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+                    <div className="space-y-1 flex-1">
+                      <h3 className="text-sm font-bold text-amber-950">
+                        Belum Ada Data Berstatus verified_karu untuk {monthlyNurseReport.logbook.nurseName} pada Periode {currentMonthYearTitle}
+                      </h3>
+                      <p className="text-xs text-amber-900/90 leading-relaxed">
+                        Tabel matriks horizontal 1–31 di bawah ini melacak akumulasi 29 poin kegiatan asuhan keperawatan milik perawat yang telah disahkan oleh Kepala Ruang (<strong>verified_karu</strong>) di Cloud Firestore.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    {canVerifyLogbook(userRole) && onNavigateToVerifikasi && (
+                      <button
+                        type="button"
+                        onClick={onNavigateToVerifikasi}
+                        className="px-3.5 py-1.5 bg-[#164e78] hover:bg-[#103b5b] text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                      >
+                        <ShieldCheck className="w-3.5 h-3.5" />
+                        <span>Buka Halaman Verifikasi</span>
+                      </button>
+                    )}
+                    {onNavigateToLogbook && (
+                      <button
+                        type="button"
+                        onClick={onNavigateToLogbook}
+                        className="px-3.5 py-1.5 bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                      >
+                        <FileText className="w-3.5 h-3.5 text-slate-500" />
+                        <span>Buka Input Logbook</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* VIEW SWITCHER CONTENT: PRINT vs HORIZONTAL 1-31 MATRIX */}
+              {viewMode === 'print' ? (
+                <OfficialPelaksanaLogbookPrintable logbook={monthlyNurseReport.logbook} />
+              ) : (
+                <>
+                  <div className="hidden print:block">
+                    <OfficialPelaksanaLogbookPrintable logbook={monthlyNurseReport.logbook} />
+                  </div>
+
+                  {/* Large Horizontal 1-31 Matrix Table Container (29 SPO Items) */}
+                  <div className="bg-white rounded-2xl border border-slate-200/90 shadow-xs overflow-hidden print:hidden">
+                    <div className="px-5 py-3.5 bg-slate-50/90 border-b border-slate-200/80 flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-950 flex items-center gap-2">
+                          <Table className="w-4 h-4 text-[#164e78]" />
+                          <span>
+                            Matriks Akumulasi 29 Poin Kegiatan SPO — Tanggal 1 s/d 31 ({monthlyNurseReport.logbook.monthYear})
+                          </span>
+                        </h3>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          Perawat: <strong>{monthlyNurseReport.logbook.nurseName}</strong> &middot; Hanya menghitung kegiatan yang telah disahkan Kepala Ruang (<strong>verified_karu</strong>).
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => setViewMode('print')}
+                          className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300/80 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                        >
+                          <Table className="w-3.5 h-3.5 shrink-0 text-slate-500" />
+                          <span>Format Cetak A4</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handlePrint}
+                          className="px-3 py-1.5 bg-[#164e78] hover:bg-[#103b5b] text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shadow-xs"
+                        >
+                          <Printer className="w-3.5 h-3.5 shrink-0" />
+                          <span>Cetak</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleDownloadPdf}
+                          disabled={isExportingPdf}
+                          className="px-3 py-1.5 bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shadow-xs"
+                        >
+                          <FileDown className="w-3.5 h-3.5 shrink-0" />
+                          <span>{isExportingPdf ? 'Mengunduh...' : 'Simpan PDF'}</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* 31-Day Horizontal Matrix Table */}
+                    <div className="overflow-x-auto max-h-[760px] relative scrollbar-thin">
+                      <table className="w-full text-left text-xs border-collapse tabular-nums">
+                        <thead className="sticky top-0 z-20 shadow-xs">
+                          <tr className="bg-[#164e78] text-white font-bold text-center text-[10.5px]">
                             <th
-                              key={day}
-                              title={
-                                isActiveDay
-                                  ? `Hari / Tanggal Aktif: ${activeDateLabel}`
-                                  : isOutOfMonth
-                                  ? `Tidak ada tanggal ${day} pada periode ${currentRecap.logbook.monthYear}`
-                                  : `Tanggal ${day} ${currentRecap.logbook.monthYear}`
-                              }
-                              className={`p-1 border-r border-[#226ca4] w-[28px] min-w-[28px] max-w-[28px] font-mono ${
-                                isOutOfMonth
-                                  ? 'bg-slate-900/60 text-slate-500'
-                                  : isActiveDay
-                                  ? 'bg-cyan-400 text-slate-950 font-black ring-2 ring-inset ring-white'
-                                  : isVerifiedDay
-                                  ? 'bg-[#246ea3] text-white'
-                                  : 'text-slate-200'
-                              }`}
+                              rowSpan={2}
+                              className="p-2 border-r border-[#1e5d8e] w-[52px] min-w-[52px] max-w-[52px] sticky left-0 z-30 bg-[#164e78] text-center"
                             >
-                              {day}
+                              POIN
                             </th>
-                          );
-                        })}
-                      </tr>
-                    </thead>
-
-                    <tbody className="divide-y divide-slate-200 text-[11px] text-slate-800">
-                      {/* Reference Row: Number of Verified Managed Patients per Day */}
-                      <tr className="bg-indigo-50/80 font-bold text-indigo-950 group">
-                        <td
-                          colSpan={2}
-                          className="px-3 py-2 border-r border-slate-200 sticky left-0 bg-indigo-50/95 group-hover:bg-indigo-100 z-10 text-[10.5px] uppercase tracking-wider font-bold"
-                        >
-                          Pasien Terverifikasi
-                        </td>
-                        <td className="px-3 py-2 border-r border-slate-200 text-[10.5px] text-indigo-900">
-                          Jumlah pasien kelolaan yang disahkan PJ Shift / Kepala Ruang
-                        </td>
-                        {daysArray.map((day, dayIdx) => {
-                          const pCount = currentRecap.logbook.dailyVerifiedPatientCounts?.[dayIdx] || 0;
-                          const isVerif = Boolean(currentRecap.logbook.verifiedDays?.[dayIdx]) && pCount > 0;
-                          const isOutOfMonth = day > currentRecap.daysInMonth;
-                          return (
-                            <td
-                              key={day}
-                              className={`p-1 text-center font-mono border-r border-slate-200 text-[11px] ${
-                                isOutOfMonth
-                                  ? 'bg-slate-100/60 text-slate-300'
-                                  : isVerif
-                                  ? 'bg-indigo-100/90 text-indigo-950 font-black'
-                                  : 'text-slate-300'
-                              }`}
+                            <th
+                              rowSpan={2}
+                              className="p-2 border-r border-[#1e5d8e] w-[130px] min-w-[130px] max-w-[130px] text-left sticky left-[52px] z-30 bg-[#164e78]"
                             >
-                              {isOutOfMonth ? '·' : isVerif ? pCount : ''}
-                            </td>
-                          );
-                        })}
-                        <td className="p-2 text-center font-mono font-black text-indigo-950 border-l border-slate-200">
-                          {currentRecap.totalVerifiedPatientsInMonth}
-                        </td>
-                        <td
-                          colSpan={2}
-                          className="p-2 text-center text-[10.5px] font-bold text-indigo-900 border-l border-slate-200"
-                        >
-                          Pasien Disahkan
-                        </td>
-                      </tr>
+                              FASE ASUHAN
+                            </th>
+                            <th
+                              rowSpan={2}
+                              className="p-2 border-r border-[#1e5d8e] min-w-[250px] text-left bg-[#164e78]"
+                            >
+                              URAIAN 29 BUTIR KEGIATAN ASUHAN KEPERAWATAN (SPO)
+                            </th>
+                            <th
+                              colSpan={31}
+                              className="p-1.5 border-b border-[#1e5d8e] text-[10px] uppercase font-bold tracking-wider bg-[#1a5b8c] text-white"
+                            >
+                              TANGGAL 1 SAMPAI 31 HORIZONTAL (VERIFIED_KARU) — {monthlyNurseReport.logbook.monthYear.toUpperCase()}
+                            </th>
+                            <th
+                              rowSpan={2}
+                              className="p-2 border-l border-[#1e5d8e] w-[56px] min-w-[56px] text-center bg-[#164e78]"
+                            >
+                              TOTAL
+                            </th>
+                            <th
+                              rowSpan={2}
+                              className="p-2 border-l border-[#1e5d8e] w-[56px] min-w-[56px] text-center bg-[#164e78]"
+                            >
+                              MAKS
+                            </th>
+                            <th
+                              rowSpan={2}
+                              className="p-2 border-l border-[#1e5d8e] w-[56px] min-w-[56px] text-center bg-[#164e78]"
+                            >
+                              %
+                            </th>
+                          </tr>
 
-                      {/* Grouped SPO Items 1.1 through 6.5 */}
-                      {BAGIAN_SECTION_HEADERS.map((sec) => {
-                        const sectionItems = OFFICIAL_LOGBOOK_ITEMS.filter(
-                          (it) => it.bagian === sec.bagian
-                        );
-
-                        return (
-                          <React.Fragment key={sec.bagian}>
-                            {/* Section Header Row */}
-                            <tr className="bg-slate-100/95 text-slate-900 font-bold">
-                              <td
-                                colSpan={3}
-                                className="px-3 py-2 text-[10.5px] uppercase tracking-wider sticky left-0 bg-slate-100/95 z-10 border-r border-slate-300 flex items-center justify-between"
-                              >
-                                <span className="font-extrabold text-[#164e78]">{sec.title}</span>
-                                <span className="font-semibold text-slate-600 text-[10px] normal-case tracking-normal">
-                                  {sec.ruleBadge}
-                                </span>
-                              </td>
-                              <td colSpan={34} className="bg-slate-100/95 border-b border-slate-200" />
-                            </tr>
-
-                            {/* Section Item Rows */}
-                            {sectionItems.map((item, idx) => {
-                              const scoreArr = currentRecap.logbook.dailyScores?.[item.code] || [];
-                              const stat = currentRecap.itemStats[item.code] || {
-                                totalScore: 0,
-                                maxScore: 0,
-                                pct: 0
-                              };
-
+                          {/* Row 2: Horizontal Columns Date 1 to 31 */}
+                          <tr className="bg-[#1a5b8c] text-white font-bold text-[9.5px] text-center">
+                            {daysArray.map((day, idx) => {
+                              const isOutOfMonth = day > monthlyNurseReport.daysInMonth;
+                              const isActiveDay =
+                                !isOutOfMonth && day === activeParsedDate.day && isCurrentMonthActive;
+                              const isVerifiedDay =
+                                !isOutOfMonth && Boolean(monthlyNurseReport.logbook.verifiedDays?.[idx]);
                               return (
-                                <tr
-                                  key={item.code}
-                                  className={`group transition-colors ${
-                                    idx % 2 === 1
-                                      ? 'bg-slate-50/50 hover:bg-blue-50/40'
-                                      : 'bg-white hover:bg-blue-50/40'
+                                <th
+                                  key={day}
+                                  title={
+                                    isOutOfMonth
+                                      ? `Tidak ada tanggal ${day} pada periode ${monthlyNurseReport.logbook.monthYear}`
+                                      : `Tanggal ${day} ${monthlyNurseReport.logbook.monthYear}`
+                                  }
+                                  className={`p-1 border-r border-[#226ca4] w-[28px] min-w-[28px] max-w-[28px] font-mono ${
+                                    isOutOfMonth
+                                      ? 'bg-slate-900/60 text-slate-500'
+                                      : isActiveDay
+                                      ? 'bg-cyan-400 text-slate-950 font-black ring-2 ring-inset ring-white'
+                                      : isVerifiedDay
+                                      ? 'bg-[#246ea3] text-white'
+                                      : 'text-slate-200'
                                   }`}
                                 >
-                                  {/* Sticky Col 1: Poin Code */}
-                                  <td className="px-2 py-1.5 text-center font-mono font-bold text-slate-900 border-r border-slate-200 sticky left-0 z-10 bg-white group-hover:bg-blue-50/70">
-                                    {item.code}
-                                  </td>
-
-                                  {/* Sticky Col 2: Fase Asuhan */}
-                                  <td className="px-2.5 py-1.5 font-bold text-slate-800 border-r border-slate-200 sticky left-[52px] z-10 bg-white group-hover:bg-blue-50/70 leading-snug text-[10.5px]">
-                                    {item.category}
-                                  </td>
-
-                                  {/* Fluid Col 3: Uraian Kegiatan SPO */}
-                                  <td className="px-3 py-1.5 text-slate-700 border-r border-slate-200 text-[11px] leading-tight">
-                                    {item.description}
-                                  </td>
-
-                                  {/* Day Score Cells (1 to 31) */}
-                                  {daysArray.map((day, dayIdx) => {
-                                    const isOutOfMonth = day > currentRecap.daysInMonth;
-                                    const val = scoreArr[dayIdx];
-                                    const isVerif =
-                                      val !== null &&
-                                      val !== undefined &&
-                                      (Boolean(currentRecap.logbook.verifiedDays?.[dayIdx]) ||
-                                        (item.code === '3.6' && Boolean(currentRecap.logbook.hasActivityDays?.[dayIdx])));
-                                    const maxCell =
-                                      currentRecap.logbook.dailyItemMaxScores?.[item.code]?.[dayIdx] ??
-                                      (item.bagian === 1
-                                        ? 1
-                                        : currentRecap.logbook.dailyVerifiedPatientCounts?.[dayIdx] || 0);
-
-                                    const cellColor = isOutOfMonth
-                                      ? 'bg-slate-100/50 text-slate-300'
-                                      : !isVerif
-                                      ? 'text-slate-300'
-                                      : val === 0 && maxCell === 0
-                                      ? 'bg-slate-50 text-slate-400 font-semibold'
-                                      : val === maxCell && maxCell > 0
-                                      ? 'bg-emerald-50 text-emerald-900 font-bold'
-                                      : val > 0
-                                      ? 'bg-amber-50 text-amber-900 font-bold'
-                                      : 'bg-rose-50/70 text-rose-700 font-semibold';
-
-                                    return (
-                                      <td
-                                        key={day}
-                                        className={`p-1 text-center font-mono border-r border-slate-200 text-[11px] ${cellColor}`}
-                                        title={
-                                          isOutOfMonth
-                                            ? undefined
-                                            : isVerif
-                                            ? `Tanggal ${day}: Poin ${item.code} = ${val} dari ${maxCell}`
-                                            : undefined
-                                        }
-                                      >
-                                        {isOutOfMonth ? '·' : isVerif ? val : ''}
-                                      </td>
-                                    );
-                                  })}
-
-                                  {/* Right Summary Columns */}
-                                  <td className="p-2 text-center font-mono font-bold text-slate-900 border-l border-slate-200">
-                                    {stat.totalScore}
-                                  </td>
-                                  <td className="p-2 text-center font-mono text-slate-500 border-l border-slate-200">
-                                    {stat.maxScore}
-                                  </td>
-                                  <td
-                                    className={`p-2 text-center font-mono font-bold border-l border-slate-200 ${
-                                      stat.maxScore === 0
-                                        ? 'text-slate-400'
-                                        : stat.pct === 100
-                                        ? 'text-emerald-700'
-                                        : stat.pct >= 75
-                                        ? 'text-amber-700'
-                                        : 'text-rose-700'
-                                    }`}
-                                  >
-                                    {stat.pct}%
-                                  </td>
-                                </tr>
+                                  {day}
+                                </th>
                               );
                             })}
-                          </React.Fragment>
-                        );
-                      })}
+                          </tr>
+                        </thead>
 
-                      {/* Sticky Footer Sums */}
-                      <tr className="bg-slate-100 text-slate-950 font-bold text-center border-t-2 border-slate-300 text-[10.5px] sticky bottom-0 z-10 shadow-xs">
-                        <td
-                          colSpan={3}
-                          className="px-3 py-2.5 border-r border-slate-300 text-right uppercase tracking-wider font-black sticky left-0 bg-slate-100 z-10"
-                        >
-                          TOTAL NILAI KEGIATAN SPO TERVERIFIKASI
-                        </td>
-                        {daysArray.map((day, dayIdx) => {
-                          const isOutOfMonth = day > currentRecap.daysInMonth;
-                          const daySum = currentRecap.dailyTotalScores[dayIdx];
-                          const dayMax = currentRecap.dailyMaxScores[dayIdx];
-                          const hasDay = daySum !== null && daySum !== undefined && !isOutOfMonth;
-                          return (
+                        <tbody className="divide-y divide-slate-200 text-[11px] text-slate-800">
+                          {/* Reference Row: Verified_Karu Patients per Day (1..31) */}
+                          <tr className="bg-indigo-50/80 font-bold text-indigo-950 group">
                             <td
-                              key={dayIdx}
-                              className={`p-1 border-r border-slate-300 font-mono ${
-                                isOutOfMonth
-                                  ? 'bg-slate-200/50 text-slate-400'
-                                  : hasDay
-                                  ? 'bg-emerald-50 text-slate-950 font-black'
-                                  : 'text-slate-300'
-                              }`}
-                              title={hasDay ? `Nilai Harian: ${daySum} / ${dayMax}` : undefined}
+                              colSpan={2}
+                              className="px-3 py-2 border-r border-slate-200 sticky left-0 bg-indigo-50/95 group-hover:bg-indigo-100 z-10 text-[10.5px] uppercase tracking-wider font-bold"
                             >
-                              {isOutOfMonth ? '·' : hasDay ? daySum : ''}
+                              Pasien (verified_karu)
                             </td>
-                          );
-                        })}
-                        <td className="p-2 border-l border-slate-300 font-mono font-black text-[#164e78] text-xs">
-                          {currentRecap.grandTotalScore}
-                        </td>
-                        <td className="p-2 border-l border-slate-300 font-mono font-bold text-slate-600 text-xs">
-                          {currentRecap.grandMaxScore}
-                        </td>
-                        <td className="p-2 border-l border-slate-300 font-mono font-black text-emerald-800 text-xs">
-                          {currentRecap.overallCompliancePct}%
-                        </td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              </div>
+                            <td className="px-3 py-2 border-r border-slate-200 text-[10.5px] text-indigo-900">
+                              Jumlah sesi pasien kelolaan perawat yang telah disahkan Kepala Ruang
+                            </td>
+                            {daysArray.map((day, dayIdx) => {
+                              const pCount =
+                                monthlyNurseReport.logbook.dailyVerifiedPatientCounts?.[dayIdx] || 0;
+                              const isVerif =
+                                Boolean(monthlyNurseReport.logbook.verifiedDays?.[dayIdx]) &&
+                                pCount > 0;
+                              const isOutOfMonth = day > monthlyNurseReport.daysInMonth;
+                              return (
+                                <td
+                                  key={day}
+                                  className={`p-1 text-center font-mono border-r border-slate-200 text-[11px] ${
+                                    isOutOfMonth
+                                      ? 'bg-slate-100/60 text-slate-300'
+                                      : isVerif
+                                      ? 'bg-indigo-100/90 text-indigo-950 font-black'
+                                      : 'text-slate-300'
+                                  }`}
+                                >
+                                  {isOutOfMonth ? '·' : isVerif ? pCount : ''}
+                                </td>
+                              );
+                            })}
+                            <td className="p-2 text-center font-mono font-black text-indigo-950 border-l border-slate-200">
+                              {monthlyNurseReport.totalVerifiedPatientsInMonth}
+                            </td>
+                            <td
+                              colSpan={2}
+                              className="p-2 text-center text-[10.5px] font-bold text-indigo-900 border-l border-slate-200"
+                            >
+                              Pasien Disahkan
+                            </td>
+                          </tr>
+
+                          {/* Grouped 29 SPO Items (1.1 through 6.5) */}
+                          {BAGIAN_SECTION_HEADERS.map((sec) => {
+                            const sectionItems = OFFICIAL_LOGBOOK_ITEMS.filter(
+                              (it) => it.bagian === sec.bagian
+                            );
+
+                            return (
+                              <React.Fragment key={sec.bagian}>
+                                <tr className="bg-slate-100/95 text-slate-900 font-bold">
+                                  <td
+                                    colSpan={3}
+                                    className="px-3 py-2 text-[10.5px] uppercase tracking-wider sticky left-0 bg-slate-100/95 z-10 border-r border-slate-300"
+                                  >
+                                    <div className="flex items-center justify-between gap-2">
+                                      <span className="font-extrabold text-[#164e78]">{sec.title}</span>
+                                      <span className="font-semibold text-slate-600 text-[10px] normal-case tracking-normal">
+                                        {sec.ruleBadge}
+                                      </span>
+                                    </div>
+                                  </td>
+                                  <td colSpan={34} className="bg-slate-100/95 border-b border-slate-200" />
+                                </tr>
+
+                                {sectionItems.map((item, idx) => {
+                                  const scoreArr =
+                                    monthlyNurseReport.logbook.dailyScores?.[item.code] || [];
+                                  const stat = monthlyNurseReport.itemStats[item.code] || {
+                                    totalScore: 0,
+                                    maxScore: 0,
+                                    pct: 0
+                                  };
+
+                                  return (
+                                    <tr
+                                      key={item.code}
+                                      className={`group transition-colors ${
+                                        idx % 2 === 1
+                                          ? 'bg-slate-50/50 hover:bg-blue-50/40'
+                                          : 'bg-white hover:bg-blue-50/40'
+                                      }`}
+                                    >
+                                      <td className="px-2 py-1.5 text-center font-mono font-bold text-slate-900 border-r border-slate-200 sticky left-0 z-10 bg-white group-hover:bg-blue-50/70">
+                                        {item.code}
+                                      </td>
+                                      <td className="px-2.5 py-1.5 font-bold text-slate-800 border-r border-slate-200 sticky left-[52px] z-10 bg-white group-hover:bg-blue-50/70 leading-snug text-[10.5px]">
+                                        {item.category}
+                                      </td>
+                                      <td className="px-3 py-1.5 text-slate-700 border-r border-slate-200 text-[11px] leading-tight">
+                                        {item.description}
+                                      </td>
+
+                                      {/* Horizontal Date Columns 1 to 31 */}
+                                      {daysArray.map((day, dayIdx) => {
+                                        const isOutOfMonth = day > monthlyNurseReport.daysInMonth;
+                                        const val = scoreArr[dayIdx];
+                                        const isVerif =
+                                          val !== null &&
+                                          val !== undefined &&
+                                          Boolean(monthlyNurseReport.logbook.verifiedDays?.[dayIdx]);
+                                        const maxCell =
+                                          monthlyNurseReport.logbook.dailyItemMaxScores?.[item.code]?.[
+                                            dayIdx
+                                          ] ??
+                                          (item.bagian === 1
+                                            ? 1
+                                            : monthlyNurseReport.logbook
+                                                .dailyVerifiedPatientCounts?.[dayIdx] || 0);
+
+                                        const cellColor = isOutOfMonth
+                                          ? 'bg-slate-100/50 text-slate-300'
+                                          : !isVerif
+                                          ? 'text-slate-300'
+                                          : val === 0 && maxCell === 0
+                                          ? 'bg-slate-50 text-slate-400 font-semibold'
+                                          : val === maxCell && maxCell > 0
+                                          ? 'bg-emerald-50 text-emerald-900 font-bold'
+                                          : (val ?? 0) > 0
+                                          ? 'bg-amber-50 text-amber-900 font-bold'
+                                          : 'bg-rose-50/70 text-rose-700 font-semibold';
+
+                                        return (
+                                          <td
+                                            key={day}
+                                            className={`p-1 text-center font-mono border-r border-slate-200 text-[11px] ${cellColor}`}
+                                            title={
+                                              isOutOfMonth
+                                                ? undefined
+                                                : isVerif
+                                                ? `Tanggal ${day}: Poin ${item.code} = ${val} dari ${maxCell} (verified_karu)`
+                                                : undefined
+                                            }
+                                          >
+                                            {isOutOfMonth ? '·' : isVerif ? val : ''}
+                                          </td>
+                                        );
+                                      })}
+
+                                      <td className="p-2 text-center font-mono font-bold text-slate-900 border-l border-slate-200">
+                                        {stat.totalScore}
+                                      </td>
+                                      <td className="p-2 text-center font-mono text-slate-500 border-l border-slate-200">
+                                        {stat.maxScore}
+                                      </td>
+                                      <td
+                                        className={`p-2 text-center font-mono font-bold border-l border-slate-200 ${
+                                          stat.maxScore === 0
+                                            ? 'text-slate-400'
+                                            : stat.pct === 100
+                                            ? 'text-emerald-700'
+                                            : stat.pct >= 75
+                                            ? 'text-amber-700'
+                                            : 'text-rose-700'
+                                        }`}
+                                      >
+                                        {stat.pct}%
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </React.Fragment>
+                            );
+                          })}
+
+                          {/* Sticky Footer Sums across 1..31 */}
+                          <tr className="bg-slate-100 text-slate-950 font-bold text-center border-t-2 border-slate-300 text-[10.5px] sticky bottom-0 z-10 shadow-xs">
+                            <td
+                              colSpan={3}
+                              className="px-3 py-2.5 border-r border-slate-300 text-right uppercase tracking-wider font-black sticky left-0 bg-slate-100 z-10"
+                            >
+                              TOTAL AKUMULASI 29 POIN SPO (VERIFIED_KARU)
+                            </td>
+                            {daysArray.map((day, dayIdx) => {
+                              const isOutOfMonth = day > monthlyNurseReport.daysInMonth;
+                              const daySum = monthlyNurseReport.dailyTotalScores[dayIdx];
+                              const dayMax = monthlyNurseReport.dailyMaxScores[dayIdx];
+                              const hasDay =
+                                daySum !== null && daySum !== undefined && !isOutOfMonth;
+                              return (
+                                <td
+                                  key={dayIdx}
+                                  className={`p-1 border-r border-slate-300 font-mono ${
+                                    isOutOfMonth
+                                      ? 'bg-slate-200/50 text-slate-400'
+                                      : hasDay
+                                      ? 'bg-emerald-50 text-slate-950 font-black'
+                                      : 'text-slate-300'
+                                  }`}
+                                  title={
+                                    hasDay
+                                      ? `Total Harian Tanggal ${day}: ${daySum} / ${dayMax}`
+                                      : undefined
+                                  }
+                                >
+                                  {isOutOfMonth ? '·' : hasDay ? daySum : ''}
+                                </td>
+                              );
+                            })}
+                            <td className="p-2 border-l border-slate-300 font-mono font-black text-[#164e78] text-xs">
+                              {monthlyNurseReport.grandTotalScore}
+                            </td>
+                            <td className="p-2 border-l border-slate-300 font-mono font-bold text-slate-600 text-xs">
+                              {monthlyNurseReport.grandMaxScore}
+                            </td>
+                            <td className="p-2 border-l border-slate-300 font-mono font-black text-emerald-800 text-xs">
+                              {monthlyNurseReport.overallCompliancePct}%
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </>
+              )}
             </>
-          )}
+          ) : null}
         </div>
       )}
     </div>

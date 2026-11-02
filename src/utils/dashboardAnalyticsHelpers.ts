@@ -6,6 +6,7 @@ import {
 } from '../types/dialysis.ts';
 import { getCurrentIndonesianFullDate } from './dateHelpers.ts';
 import { resolveNurseSystemAccess } from './masterDataHelpers.ts';
+import { logbookService } from '../data/officialPelaksanaLogbookData.ts';
 import {
   VerifiedDailySnapshot,
   getDaysInMonth,
@@ -275,6 +276,32 @@ function aggregateSingleStaffYear(params: {
       snap.verifiedPatientCount > 0
     ) {
       verifiedByMonthDay[snap.month][snap.day] = snap.verifiedPatientCount;
+    }
+  });
+
+  // 2b. Overlay verified reports from logbookService.getCachedVerifiedReports() for targetYear
+  const serviceVerified = logbookService.getCachedVerifiedReports({
+    tahun: targetYear,
+    namaPerawat: staff.name
+  });
+  serviceVerified.forEach((rec) => {
+    const matchIso = (rec.tanggal || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!matchIso) return;
+    const recM = parseInt(matchIso[2], 10);
+    const recD = parseInt(matchIso[3], 10);
+    if (recM >= 1 && recM <= 12 && recD >= 1 && recD <= 31) {
+      const patCount =
+        Array.isArray(rec.patients) && rec.patients.length > 0 ? rec.patients.length : 1;
+      if (!verifiedByMonthDay[recM][recD]) {
+        verifiedByMonthDay[recM][recD] = patCount;
+      }
+      if (Array.isArray(rec.patients)) {
+        rec.patients.forEach((mp) => {
+          uniqueVerifiedKeysByMonth[recM].add(
+            makePatientIdentityKey(mp.medicalRecord, mp.patientName, mp.bedNumber)
+          );
+        });
+      }
     }
   });
 
@@ -708,7 +735,22 @@ export function buildDashboardAnalytics(params: {
     staffAggregations.reduce((sum, agg) => sum + agg.totalUnverifiedSessionsAllMonths, 0);
 
   const allRegistryEntries = getVerificationRegistry();
-  const logbookPendingVerificationCount =
+  const pendingFromServiceCount =
+    currentStaffRole === 'pj_shift'
+      ? logbookService.getCachedPendingVerifications('PJ Shift', currentStaffName).length
+      : currentStaffRole === 'kepala_ruangan'
+      ? logbookService.getCachedPendingVerifications('Kepala Ruang', currentStaffName).length
+      : currentStaffRole === 'perawat_pelaksana'
+      ? logbookService
+          .getAllRecords()
+          .filter(
+            (r) =>
+              isMatchingNurse(r.namaPerawat, currentStaffName) &&
+              r.statusVerifikasi === 'submitted'
+          ).length
+      : logbookService.getAllRecords().filter((r) => r.statusVerifikasi === 'submitted').length;
+
+  const pendingFromRegistryCount =
     currentStaffRole === 'pj_shift' || currentStaffRole === 'kepala_ruangan'
       ? filterVerificationQueueForUser(allRegistryEntries, currentStaffRole, currentStaffName).filter(
           (e) => e.status === 'diajukan'
@@ -718,6 +760,8 @@ export function buildDashboardAnalytics(params: {
           (e) => isMatchingNurse(e.submittedNurseName, currentStaffName) && e.status === 'diajukan'
         ).length
       : allRegistryEntries.filter((e) => e.status === 'diajukan').length;
+
+  const logbookPendingVerificationCount = Math.max(pendingFromServiceCount, pendingFromRegistryCount);
 
   return {
     selectedMonth,

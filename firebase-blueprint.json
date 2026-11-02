@@ -131,6 +131,50 @@
         "updatedAt": { "type": "string", "maxLength": 64 }
       },
       "required": ["id", "doctorName", "date", "role"]
+    },
+    "LogbookRecord": {
+      "title": "LogbookRecord",
+      "description": "Rekam logbook SPO harian perawat pelaksana dan status verifikasi berjenjang (PJ Shift & Kepala Ruang)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "tanggal": { "type": "string", "maxLength": 32 },
+        "shift": { "type": "string", "maxLength": 32 },
+        "perawatId": { "type": "string", "maxLength": 128 },
+        "namaPerawat": { "type": "string", "maxLength": 300 },
+        "statusVerifikasi": {
+          "type": "string",
+          "enum": ["draft", "submitted", "verified_pj", "verified_karu"],
+          "maxLength": 32
+        },
+        "verifikatorPjId": { "type": "string", "maxLength": 128 },
+        "verifikatorKaruId": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "tanggal", "namaPerawat", "statusVerifikasi"]
+    },
+    "PatientSessionReport": {
+      "title": "PatientSessionReport",
+      "description": "Rekam sesi pelayanan klinis pasien hemodialisa untuk antrean verifikasi dan laporan pasien terverifikasi Kepala Ruang",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "tanggal": { "type": "string", "maxLength": 32 },
+        "shift": { "type": "string", "maxLength": 32 },
+        "noRm": { "type": "string", "maxLength": 64 },
+        "namaPasien": { "type": "string", "maxLength": 300 },
+        "noBedMesin": { "type": "string", "maxLength": 64 },
+        "perawatPelaksana": { "type": "string", "maxLength": 300 },
+        "statusVerifikasi": {
+          "type": "string",
+          "enum": ["draft", "submitted", "verified_pj", "verified_karu"],
+          "maxLength": 32
+        },
+        "verifikatorPjId": { "type": "string", "maxLength": 128 },
+        "verifikatorKaruId": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "tanggal", "namaPasien", "statusVerifikasi"]
     }
   },
   "firestore": {
@@ -173,6 +217,14 @@
     "/verification_registry/{regId}": {
       "schema": { "$ref": "#/entities/VerificationRegistry" },
       "description": "Pusat antrean verifikasi logbook perawat oleh PJ Shift dan Kepala Ruangan"
+    },
+    "/logbooks/{logbookId}": {
+      "schema": { "$ref": "#/entities/LogbookRecord" },
+      "description": "Rekam logbook SPO harian perawat untuk verifikasi PJ Shift / Kepala Ruang dan laporan resmi"
+    },
+    "/patient_sessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/PatientSessionReport" },
+      "description": "Rekam sesi klinis pasien hemodialisa untuk verifikasi berjenjang dan laporan pasien"
     }
   }
 }

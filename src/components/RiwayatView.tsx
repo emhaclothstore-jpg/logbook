@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { PatientHDSession, ShiftInfo, MasterNurse, SystemAccessRole } from '../types/dialysis.ts';
 import {
   Search,
@@ -14,7 +14,9 @@ import {
   UserCheck,
   Calendar,
   Filter,
-  CheckCircle2
+  CheckCircle2,
+  Loader2,
+  AlertCircle
 } from 'lucide-react';
 import { PelaksanaLogbookPrintableModal } from './PelaksanaLogbookPrintableModal.tsx';
 import { LoginUserData } from './LoginPage.tsx';
@@ -22,10 +24,14 @@ import {
   filterSessionsForNurseRiwayat,
   isSessionVerifiedByPj,
   isMatchingNurse,
+  isSameBed,
   getNurseManagedPatientsKey,
   getVerificationRegistry,
   ManagedPatientMinimal
 } from '../utils/nurseVerificationHelpers.ts';
+import { logbookService } from '../data/officialPelaksanaLogbookData.ts';
+import { pasienLogbookService } from '../data/laporanPasienData.ts';
+import { ensureFullBagianData } from '../utils/logbookStandards.ts';
 import {
   getCurrentIsoDateWib,
   indonesianDateLabelToIso,
@@ -58,7 +64,80 @@ export const RiwayatView: React.FC<RiwayatViewProps> = ({
   const [selectedDateFilter, setSelectedDateFilter] = useState<string>('all');
   const [selectedShiftFilter, setSelectedShiftFilter] = useState<string>('all');
   const [printingSession, setPrintingSession] = useState<PatientHDSession | null>(null);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [isLoadingHistory, setIsLoadingHistory] = useState<boolean>(true);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const selectedNurseFilter = 'mine';
+
+  useEffect(() => {
+    const handleUpdate = () => setRefreshTick((t) => t + 1);
+    window.addEventListener('logbook_records_updated', handleUpdate);
+    window.addEventListener('verification_registry_updated', handleUpdate);
+    window.addEventListener('storage', handleUpdate);
+    return () => {
+      window.removeEventListener('logbook_records_updated', handleUpdate);
+      window.removeEventListener('verification_registry_updated', handleUpdate);
+      window.removeEventListener('storage', handleUpdate);
+    };
+  }, []);
+
+  // Tarik laporan terverifikasi ('verified_karu') secara asinkron setiap kali filter tanggal diubah
+  useEffect(() => {
+    let isMounted = true;
+    const rangeDate =
+      selectedDateFilter !== 'all' && selectedDateFilter.includes('-')
+        ? selectedDateFilter
+        : undefined;
+
+    const loadVerifiedHistoryFromCloud = async () => {
+      setIsLoadingHistory(true);
+      setHistoryError(null);
+      try {
+        await Promise.all([
+          logbookService.getVerifiedReports(rangeDate, rangeDate),
+          pasienLogbookService.getVerifiedPatientReports(rangeDate, rangeDate)
+        ]);
+        if (isMounted) {
+          setRefreshTick((t) => t + 1);
+        }
+      } catch (err) {
+        console.error('Gagal memuat arsip riwayat terverifikasi dari Cloud Firestore:', err);
+        if (isMounted) {
+          setHistoryError(
+            'Gagal memuat riwayat logbook terverifikasi dari jaringan Cloud Firestore.'
+          );
+        }
+      } finally {
+        if (isMounted) {
+          setIsLoadingHistory(false);
+        }
+      }
+    };
+
+    void loadVerifiedHistoryFromCloud();
+
+    const unsubLogs = logbookService.subscribeVerifiedReports(rangeDate, rangeDate, () => {
+      if (!isMounted) return;
+      setRefreshTick((t) => t + 1);
+      setIsLoadingHistory(false);
+    });
+
+    const unsubPatients = pasienLogbookService.subscribeVerifiedPatientReports(
+      rangeDate,
+      rangeDate,
+      () => {
+        if (!isMounted) return;
+        setRefreshTick((t) => t + 1);
+        setIsLoadingHistory(false);
+      }
+    );
+
+    return () => {
+      isMounted = false;
+      unsubLogs();
+      unsubPatients();
+    };
+  }, [selectedDateFilter]);
 
   const isSupervisor =
     userRole === 'pj_shift' || userRole === 'kepala_ruangan' || userRole === 'administrator';
@@ -105,6 +184,14 @@ export const RiwayatView: React.FC<RiwayatViewProps> = ({
           parsed.forEach(pushUnique);
         }
       }
+      const verifiedService = logbookService.getCachedVerifiedReports({
+        namaPerawat: currentNurseName
+      });
+      verifiedService.forEach((rec) => {
+        if (rec.patients && Array.isArray(rec.patients)) {
+          rec.patients.forEach(pushUnique);
+        }
+      });
       const allReg = getVerificationRegistry().filter((e) =>
         isMatchingNurse(e.submittedNurseName, currentNurseName)
       );
@@ -117,7 +204,138 @@ export const RiwayatView: React.FC<RiwayatViewProps> = ({
       // ignore
     }
     return list;
-  }, [currentNurseName, sessions]);
+  }, [currentNurseName, sessions, refreshTick]);
+
+  // Gabungkan sesi yang ada dengan laporan resmi yang telah disetujui Kepala Ruang ('verified_karu')
+  const effectiveSessions = useMemo<PatientHDSession[]>(() => {
+    void refreshTick;
+    const combined: PatientHDSession[] = [...sessions];
+    const verifiedReports = logbookService.getCachedVerifiedReports();
+
+    const existsInCombined = (
+      dateIso: string,
+      shiftName: string,
+      nurseName: string,
+      bedNumber?: string,
+      rm?: string,
+      patName?: string
+    ) => {
+      const cleanRm = (rm || '').trim().toLowerCase();
+      const cleanPat = (patName || '').trim().toLowerCase();
+      return combined.some((s) => {
+        const sIso = s.sessionDate || (s.date ? indonesianDateLabelToIso(s.date) : '');
+        if (sIso && dateIso && sIso !== dateIso) return false;
+        if (shiftName && s.shift && s.shift !== shiftName) return false;
+        if (cleanRm && s.medicalRecordNumber?.trim().toLowerCase() === cleanRm) return true;
+        if (cleanPat && s.patientName.trim().toLowerCase() === cleanPat) return true;
+        return Boolean(
+          bedNumber &&
+            isMatchingNurse(s.nurseInCharge, nurseName) &&
+            isSameBed(s.bedNumber, bedNumber)
+        );
+      });
+    };
+
+    verifiedReports.forEach((rec) => {
+      const recShift = rec.shift === 'Siang' ? 'Siang' : 'Pagi';
+      const isKaru = rec.statusVerifikasi === 'verified_karu';
+      const verifierName = rec.verifikatorKaruNama || rec.verifikatorPjNama || (isKaru ? 'Kepala Ruang' : 'PJ Shift');
+      const verifiedStamp = rec.verifiedKaruAt || rec.verifiedPjAt || rec.updatedAt;
+
+      if (Array.isArray(rec.sessionsSnapshot)) {
+        rec.sessionsSnapshot.forEach((snap) => {
+          if (
+            !existsInCombined(
+              rec.tanggal,
+              recShift,
+              rec.namaPerawat,
+              snap.bedNumber,
+              snap.medicalRecordNumber,
+              snap.patientName
+            )
+          ) {
+            combined.push({
+              ...snap,
+              isVerifiedByPj: !isKaru,
+              isVerifiedByKepalaRuang: isKaru,
+              verificationStatus: 'terverifikasi',
+              verifiedBy: snap.verifiedBy || verifierName,
+              verifiedByRole: snap.verifiedByRole || (isKaru ? 'Kepala Ruang' : 'PJ Shift'),
+              verifiedAt: snap.verifiedAt || verifiedStamp
+            });
+          }
+        });
+      }
+
+      if (Array.isArray(rec.patients)) {
+        rec.patients.forEach((mp, idx) => {
+          if (!mp.patientName && !mp.bedNumber) return;
+          if (
+            existsInCombined(
+              rec.tanggal,
+              recShift,
+              rec.namaPerawat,
+              mp.bedNumber,
+              mp.medicalRecord,
+              mp.patientName
+            )
+          ) {
+            return;
+          }
+          combined.push(
+            ensureFullBagianData({
+              id: mp.id || `riwayat-${rec.id}-${idx}`,
+              date: rec.tanggalLabel || formatIsoDateToIndonesianFull(rec.tanggal),
+              sessionDate: rec.tanggal,
+              shift: recShift,
+              bedNumber: mp.bedNumber || 'BED A01',
+              patientName: mp.patientName || 'Pasien HD',
+              medicalRecordNumber: mp.medicalRecord || '',
+              age: 54,
+              gender: 'L',
+              status: 'rajal',
+              category: 'reguler',
+              sessionStatus: 'selesai',
+              isCito: false,
+              vascularAccess: 'av_fistula',
+              accessSite: 'AVF Radiocephalica',
+              dialyzerModel: 'SAS HF 18',
+              isReuse: false,
+              dryWeight: 60,
+              preWeight: 62.4,
+              postWeight: 60,
+              targetUf: 2400,
+              achievedUf: 2400,
+              durationPrescribed: 4.5,
+              durationActual: 4.5,
+              bloodFlowQb: 220,
+              dialysateFlowQd: 500,
+              preBp: '140/85',
+              postBp: '125/80',
+              hasHypotension: false,
+              hasMuscleCramps: false,
+              hasClotting: false,
+              hasFirstUseSyndrome: false,
+              hasAccessBleeding: false,
+              hasConsultDpjp: false,
+              underUfTolerated: false,
+              nurseInCharge: rec.namaPerawat,
+              dokterDpjp: rec.dokterDpjp,
+              dokterJaga: rec.dokterJaga,
+              isVerifiedByPj: !isKaru,
+              isVerifiedByKepalaRuang: isKaru,
+              verificationStatus: 'terverifikasi',
+              verifiedBy: mp.verifiedBy || verifierName,
+              verifiedByRole: mp.verifiedByRole || (isKaru ? 'Kepala Ruang' : 'PJ Shift'),
+              verifiedAt: mp.verifiedAt || verifiedStamp
+            })
+          );
+        });
+      }
+    });
+
+    return combined;
+  }, [sessions, refreshTick]);
 
   // Apply clinical governance & verification workflow across all sessions
   const {
@@ -131,7 +349,7 @@ export const RiwayatView: React.FC<RiwayatViewProps> = ({
     verifiedByKaruCount
   } = useMemo(() => {
     return filterSessionsForNurseRiwayat(
-      sessions,
+      effectiveSessions,
       currentNurseName,
       userRole,
       selectedNurseFilter,
@@ -141,7 +359,7 @@ export const RiwayatView: React.FC<RiwayatViewProps> = ({
       selectedShiftFilter
     );
   }, [
-    sessions,
+    effectiveSessions,
     currentNurseName,
     userRole,
     selectedNurseFilter,
@@ -220,6 +438,12 @@ export const RiwayatView: React.FC<RiwayatViewProps> = ({
               {allAvailableDates.length} Hari
             </div>
           </div>
+          {isLoadingHistory && (
+            <div className="inline-flex items-center gap-1.5 px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-blue-700">
+              <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+              <span>Memuat Cloud...</span>
+            </div>
+          )}
           {onLoadBenchmarkData && (
             <button
               type="button"
@@ -233,6 +457,13 @@ export const RiwayatView: React.FC<RiwayatViewProps> = ({
           )}
         </div>
       </div>
+
+      {historyError && (
+        <div className="bg-rose-50 border border-rose-200 rounded-2xl p-3.5 flex items-center gap-2 text-xs text-rose-900">
+          <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+          <span className="font-semibold">{historyError}</span>
+        </div>
+      )}
 
       {/* RBAC Nurse Ownership & Verification Status Notice */}
       <div className="bg-white rounded-2xl border border-slate-200/90 p-4 shadow-xs">

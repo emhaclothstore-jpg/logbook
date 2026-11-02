@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   ClipboardCheck,
   CheckCircle2,
@@ -7,6 +7,9 @@ import {
   Search,
   RotateCcw,
   AlertTriangle,
+  AlertCircle,
+  Loader2,
+  RefreshCw,
   X,
   MessageSquare,
   Send,
@@ -15,7 +18,18 @@ import {
   Edit3
 } from 'lucide-react';
 import { ShiftInfo, MasterNurse, SystemAccessRole, PatientHDSession } from '../types/dialysis.ts';
-import { OFFICIAL_LOGBOOK_ITEMS } from '../data/officialPelaksanaLogbookData.ts';
+import {
+  OFFICIAL_LOGBOOK_ITEMS,
+  logbookService,
+  type LogbookHarianRecord
+} from '../data/officialPelaksanaLogbookData.ts';
+import {
+  pasienLogbookService,
+  buildDeterministicPatientSessionId,
+  convertSessionToLaporanRow,
+  formatBedAndMachineLabel,
+  type LaporanPasienRow
+} from '../data/laporanPasienData.ts';
 import { LoginUserData } from './LoginPage.tsx';
 import { ManagedPatient, PjVerificationSubmission, PjVerificationStatus } from './Logbook5ButtonsView.tsx';
 import { formatSystemAccessLabel } from '../utils/masterDataHelpers.ts';
@@ -29,6 +43,7 @@ import {
   isSameBed,
   getVerificationRegistry,
   upsertVerificationRegistryEntry,
+  convertLogbookRecordToRegistryEntry,
   filterVerificationQueueForUser,
   LogbookVerificationRegistryEntry,
   ManagedPatientMinimal,
@@ -143,6 +158,9 @@ interface RosterVerificationRecord {
   dateKey?: string;
   dateLabel?: string;
   status: PjVerificationStatus;
+  statusVerifikasi?: LogbookHarianRecord['statusVerifikasi'];
+  verifikatorPjNama?: string;
+  verifiedPjAt?: string;
   submittedAt?: string;
   verifiedAt?: string;
   verifiedBy?: string;
@@ -151,6 +169,8 @@ interface RosterVerificationRecord {
   verifierNotes: string;
   facilityCompleted: number;
   facilityTotal: number;
+  rawItemsCompleted?: number;
+  rawItemsTotal?: number;
   patientsSummary: PatientVerificationDetail[];
 }
 
@@ -240,10 +260,26 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
       : formatSystemAccessLabel(userRole);
 
   const [searchQuery, setSearchQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | PjVerificationStatus>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | PjVerificationStatus>('diajukan');
   const [toastMsg, setToastMsg] = useState<string | null>(null);
 
-  // Verification registry entries synced with localStorage
+  // Cloud Firestore Verification Queue States (logbookService + pasienLogbookService)
+  const [isLoadingCloud, setIsLoadingCloud] = useState<boolean>(true);
+  const [cloudError, setCloudError] = useState<string | null>(null);
+  const [verifyingKeyMap, setVerifyingKeyMap] = useState<Record<string, boolean>>({});
+  const [pendingCloudLogbooks, setPendingCloudLogbooks] = useState<LogbookHarianRecord[]>(() =>
+    userRole === 'kepala_ruangan'
+      ? logbookService.getCachedPendingVerifications('Kepala Ruang', verifierName)
+      : logbookService.getCachedPendingVerifications('PJ Shift', verifierName)
+  );
+  const [pendingPatientSessions, setPendingPatientSessions] = useState<LaporanPasienRow[]>([]);
+
+  // Load logbook records cache via logbookService
+  const [serviceRecords, setServiceRecords] = useState<LogbookHarianRecord[]>(() =>
+    logbookService.getAllRecords()
+  );
+
+  // Verification registry entries synced with localStorage / Firestore
   const [registryEntries, setRegistryEntries] = useState<LogbookVerificationRegistryEntry[]>(() =>
     getVerificationRegistry(masterNurses, validPjShift, validKaruShift)
   );
@@ -280,11 +316,117 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
     return {};
   });
 
-  // Refresh registry & per-patient records when tab mounts, sessions change, or cloud/local events fire
+  // Fetch antrean verifikasi secara asinkron dari Cloud Firestore (logbookService & pasienLogbookService)
+  const fetchCloudVerificationQueue = useCallback(async () => {
+    setIsLoadingCloud(true);
+    setCloudError(null);
+    try {
+      if (userRole === 'administrator') {
+        const [pjLogs, karuLogs, pjSessions, karuSessions] = await Promise.all([
+          logbookService.getPendingVerifications('PJ Shift'),
+          logbookService.getPendingVerifications('Kepala Ruang'),
+          pasienLogbookService.getSessionsForVerification('PJ Shift'),
+          pasienLogbookService.getSessionsForVerification('Kepala Ruang')
+        ]);
+        const mergedLogsMap = new Map<string, LogbookHarianRecord>();
+        [...pjLogs, ...karuLogs].forEach((r) => mergedLogsMap.set(r.id, r));
+        const mergedSessMap = new Map<string, LaporanPasienRow>();
+        [...pjSessions, ...karuSessions].forEach((s) => mergedSessMap.set(s.id, s));
+
+        setPendingCloudLogbooks(Array.from(mergedLogsMap.values()));
+        setPendingPatientSessions(Array.from(mergedSessMap.values()));
+      } else {
+        const serviceRole: 'PJ Shift' | 'Kepala Ruang' =
+          userRole === 'kepala_ruangan' ? 'Kepala Ruang' : 'PJ Shift';
+        const [pendingLogs, pendingSessions] = await Promise.all([
+          logbookService.getPendingVerifications(serviceRole, verifierName),
+          pasienLogbookService.getSessionsForVerification(serviceRole)
+        ]);
+        setPendingCloudLogbooks(pendingLogs);
+        setPendingPatientSessions(pendingSessions);
+      }
+      setServiceRecords(logbookService.getAllRecords());
+    } catch (err) {
+      console.error('Gagal memuat antrean verifikasi dari Cloud Firestore:', err);
+      setCloudError(
+        'Gagal memuat antrean verifikasi terbaru dari jaringan cloud. Menampilkan data sinkron terakhir.'
+      );
+    } finally {
+      setIsLoadingCloud(false);
+    }
+  }, [userRole, verifierName]);
+
+  // Initial cloud fetch + real-time Firestore onSnapshot subscriptions for multi-device sync
   useEffect(() => {
+    void fetchCloudVerificationQueue();
+
+    if (userRole === 'administrator') {
+      const unsubLogPj = logbookService.subscribePendingVerifications('PJ Shift', () => {
+        const combined = [
+          ...logbookService.getCachedPendingVerifications('PJ Shift'),
+          ...logbookService.getCachedPendingVerifications('Kepala Ruang')
+        ];
+        const dedup = new Map<string, LogbookHarianRecord>();
+        combined.forEach((r) => dedup.set(r.id, r));
+        setPendingCloudLogbooks(Array.from(dedup.values()));
+        setServiceRecords(logbookService.getAllRecords());
+      });
+      const unsubLogKaru = logbookService.subscribePendingVerifications('Kepala Ruang', () => {
+        const combined = [
+          ...logbookService.getCachedPendingVerifications('PJ Shift'),
+          ...logbookService.getCachedPendingVerifications('Kepala Ruang')
+        ];
+        const dedup = new Map<string, LogbookHarianRecord>();
+        combined.forEach((r) => dedup.set(r.id, r));
+        setPendingCloudLogbooks(Array.from(dedup.values()));
+        setServiceRecords(logbookService.getAllRecords());
+      });
+      const unsubSess = pasienLogbookService.subscribeSessionsForVerification(
+        'Kepala Ruang',
+        (rows) => {
+          setPendingPatientSessions(rows);
+        }
+      );
+      return () => {
+        unsubLogPj();
+        unsubLogKaru();
+        unsubSess();
+      };
+    }
+
+    const serviceRole: 'PJ Shift' | 'Kepala Ruang' =
+      userRole === 'kepala_ruangan' ? 'Kepala Ruang' : 'PJ Shift';
+
+    const unsubLogs = logbookService.subscribePendingVerifications(
+      serviceRole,
+      (records) => {
+        setPendingCloudLogbooks(records);
+        setServiceRecords(logbookService.getAllRecords());
+      },
+      undefined,
+      verifierName
+    );
+
+    const unsubPatientSessions = pasienLogbookService.subscribeSessionsForVerification(
+      serviceRole,
+      (rows) => {
+        setPendingPatientSessions(rows);
+      }
+    );
+
+    return () => {
+      unsubLogs();
+      unsubPatientSessions();
+    };
+  }, [fetchCloudVerificationQueue, userRole, verifierName]);
+
+  // Refresh logbookService & per-patient records when tab mounts, sessions change, or cloud/local events fire
+  useEffect(() => {
+    setServiceRecords(logbookService.getAllRecords());
     setRegistryEntries(getVerificationRegistry(masterNurses, validPjShift, validKaruShift));
 
     const handleCloudUpdate = () => {
+      setServiceRecords(logbookService.getAllRecords());
       setRegistryEntries(getVerificationRegistry(masterNurses, validPjShift, validKaruShift));
       try {
         const saved = localStorage.getItem(PER_PATIENT_STATUS_STORAGE_KEY);
@@ -300,9 +442,11 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
         // ignore
       }
     };
+    window.addEventListener('logbook_records_updated', handleCloudUpdate);
     window.addEventListener('verification_registry_updated', handleCloudUpdate);
     window.addEventListener('storage', handleCloudUpdate);
     return () => {
+      window.removeEventListener('logbook_records_updated', handleCloudUpdate);
       window.removeEventListener('verification_registry_updated', handleCloudUpdate);
       window.removeEventListener('storage', handleCloudUpdate);
     };
@@ -597,24 +741,207 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
     }
   };
 
-  // STRICT ALUR VERIFIKASI QUEUE ISOLATION:
-  // 1. PJ Shift: hanya menampilkan pengajuan verifikasi logbook yang ditujukan khusus untuk PJ Shift tersebut
-  //    (memverifikasi pasien kelolaan Perawat Pelaksana / Kepala Ruang yang memilih PJ Shift tersebut).
-  // 2. Kepala Ruang: hanya menampilkan pengajuan verifikasi logbook yang diajukan untuk Kepala Ruang
-  //    (memverifikasi pasien kelolaan PJ Shift serta pengajuan mandiri Kepala Ruang ke Kepala Ruang).
+  // ALUR VERIFIKASI BERBASIS logbookService.getPendingVerifications() & logbookService.getVerifiedReports():
+  // 1. PJ Shift: mengambil antrean dari logbookService.getPendingVerifications('PJ Shift', verifierName)
+  //    serta riwayat yang sudah diverifikasi dari logbookService.getVerifiedReports().
+  // 2. Kepala Ruang: mengambil antrean dari logbookService.getPendingVerifications('Kepala Ruang', verifierName)
+  //    (termasuk logbook berstatus 'verified_pj' untuk pengesahan berjenjang ke 'verified_karu' dan pengajuan langsung Kepala Ruang)
+  //    serta riwayat terverifikasi dari logbookService.getVerifiedReports().
   const queueRecords = useMemo<RosterVerificationRecord[]>(() => {
-    const filteredRegistry = filterVerificationQueueForUser(
+    void serviceRecords;
+    const serviceRecordById = new Map<string, LogbookHarianRecord>();
+    const combinedEntries: LogbookVerificationRegistryEntry[] = [];
+    const seenIds = new Set<string>();
+
+    const pushServiceRec = (sRec: LogbookHarianRecord) => {
+      if (!sRec || !sRec.id || seenIds.has(sRec.id)) return;
+      seenIds.add(sRec.id);
+      serviceRecordById.set(sRec.id, sRec);
+      combinedEntries.push(
+        convertLogbookRecordToRegistryEntry(sRec, { viewerRole: userRole })
+      );
+    };
+
+    // 1. Utamakan antrean real-time yang ditarik dari Cloud Firestore (pendingCloudLogbooks)
+    pendingCloudLogbooks.forEach(pushServiceRec);
+
+    if (userRole === 'kepala_ruangan') {
+      const pendingKaru = logbookService.getCachedPendingVerifications(
+        'Kepala Ruang',
+        verifierName
+      );
+      pendingKaru.forEach(pushServiceRec);
+
+      const verifiedKaru = logbookService
+        .getCachedVerifiedReports()
+        .filter((r) => r.statusVerifikasi === 'verified_karu');
+      verifiedKaru.forEach(pushServiceRec);
+
+      logbookService
+        .getAllRecords()
+        .filter(
+          (r) =>
+            r.statusVerifikasi === 'draft' &&
+            Boolean(r.revisionRequested || r.verifierNotes) &&
+            (r.targetRole === 'kepala_ruangan' ||
+              r.targetRole === 'mandiri' ||
+              r.revisionRequestedByRole === 'Kepala Ruang' ||
+              r.revisionRequestedByRole === 'Kepala Ruangan')
+        )
+        .forEach(pushServiceRec);
+    } else if (userRole === 'pj_shift') {
+      const pendingPj = logbookService.getCachedPendingVerifications('PJ Shift', verifierName);
+      pendingPj.forEach(pushServiceRec);
+
+      const verifiedPj = logbookService
+        .getAllRecords()
+        .filter(
+          (r) => r.statusVerifikasi === 'verified_pj' || r.statusVerifikasi === 'verified_karu'
+        )
+        .filter((r) => {
+          if (isMatchingNurse(r.namaPerawat, verifierName)) return false;
+          if (r.targetRole === 'kepala_ruangan' || r.targetRole === 'mandiri') return false;
+          if (
+            verifierName &&
+            verifierName !== '-' &&
+            r.targetVerifierName &&
+            r.targetVerifierName !== '-'
+          ) {
+            return isMatchingNurse(r.targetVerifierName, verifierName);
+          }
+          return true;
+        });
+      verifiedPj.forEach(pushServiceRec);
+
+      logbookService
+        .getAllRecords()
+        .filter((r) => {
+          if (r.statusVerifikasi !== 'draft' || (!r.revisionRequested && !r.verifierNotes)) {
+            return false;
+          }
+          if (isMatchingNurse(r.namaPerawat, verifierName)) return false;
+          if (r.targetRole === 'kepala_ruangan' || r.targetRole === 'mandiri') return false;
+          if (
+            verifierName &&
+            verifierName !== '-' &&
+            r.targetVerifierName &&
+            r.targetVerifierName !== '-'
+          ) {
+            return isMatchingNurse(r.targetVerifierName, verifierName);
+          }
+          return true;
+        })
+        .forEach(pushServiceRec);
+    } else if (userRole === 'administrator') {
+      logbookService.getCachedPendingVerifications('PJ Shift').forEach(pushServiceRec);
+      logbookService.getCachedPendingVerifications('Kepala Ruang').forEach(pushServiceRec);
+      logbookService.getCachedVerifiedReports().forEach(pushServiceRec);
+      logbookService
+        .getAllRecords()
+        .filter((r) => r.statusVerifikasi === 'draft' && Boolean(r.revisionRequested || r.verifierNotes))
+        .forEach(pushServiceRec);
+    }
+
+    // 2. Rekonsiliasi entri sesi pasien dari pasienLogbookService.getSessionsForVerification(role)
+    if (pendingPatientSessions.length > 0) {
+      const groupedByNurseShift = new Map<string, LaporanPasienRow[]>();
+      pendingPatientSessions.forEach((ps) => {
+        if (!ps.perawatPelaksana || ps.perawatPelaksana === '-') return;
+        if (userRole === 'pj_shift' && isMatchingNurse(ps.perawatPelaksana, verifierName)) return;
+        const gKey = `${ps.tanggal}__${ps.shift || 'Pagi'}__${getNurseStorageKey(ps.perawatPelaksana)}`;
+        const arr = groupedByNurseShift.get(gKey) || [];
+        arr.push(ps);
+        groupedByNurseShift.set(gKey, arr);
+      });
+
+      groupedByNurseShift.forEach((rowsForNurse) => {
+        const sample = rowsForNurse[0];
+        const existingIdx = combinedEntries.findIndex(
+          (e) =>
+            isMatchingNurse(e.submittedNurseName, sample.perawatPelaksana) &&
+            (e.dateKey || '') === sample.tanggal &&
+            (e.shift || 'Pagi') === (sample.shift || 'Pagi')
+        );
+
+        if (existingIdx === -1) {
+          const matchedMasterNurse = masterNurses.find((n) =>
+            isMatchingNurse(n.name, sample.perawatPelaksana)
+          );
+          combinedEntries.push({
+            id: `psgroup-${sample.tanggal}-${sample.shift || 'Pagi'}-${getNurseStorageKey(sample.perawatPelaksana)}`,
+            submittedNurseName: sample.perawatPelaksana,
+            submittedNurseNip: matchedMasterNurse?.nip || '-',
+            submittedNurseRole:
+              matchedMasterNurse?.role === 'kepala_ruangan'
+                ? 'kepala_ruangan'
+                : matchedMasterNurse?.role === 'pj_shift'
+                ? 'pj_shift'
+                : 'perawat_pelaksana',
+            targetRole: userRole === 'kepala_ruangan' ? 'kepala_ruangan' : 'pj_shift',
+            targetVerifierName: verifierName,
+            status: 'diajukan',
+            shift: sample.shift || 'Pagi',
+            dateKey: sample.tanggal,
+            dateLabel: activeDate,
+            patients: rowsForNurse.map((r) => ({
+              id: r.id,
+              bedNumber: r.noBedMesin.split('/')[0]?.trim() || r.noBedMesin,
+              patientName: r.namaPasien,
+              medicalRecord: r.noRm !== '-' ? r.noRm : undefined,
+              status: 'diajukan'
+            }))
+          });
+        }
+      });
+    }
+
+    // 3. Fallback: rekonsiliasi entri dari filterVerificationQueueForUser jika belum ada di combinedEntries
+    const fallbackFiltered = filterVerificationQueueForUser(
       registryEntries,
       userRole,
       verifierName
     );
+    fallbackFiltered.forEach((fEntry) => {
+      const alreadyPresent = combinedEntries.some(
+        (existing) =>
+          (fEntry.id && existing.id === fEntry.id) ||
+          (isMatchingNurse(existing.submittedNurseName, fEntry.submittedNurseName) &&
+            (existing.dateKey || '') === (fEntry.dateKey || '') &&
+            (existing.shift || 'Pagi') === (fEntry.shift || 'Pagi'))
+      );
+      if (!alreadyPresent) {
+        combinedEntries.push(fEntry);
+      }
+    });
 
     const facItems = OFFICIAL_LOGBOOK_ITEMS.filter((it) => it.bagian === 1);
     const patSpoItems = OFFICIAL_LOGBOOK_ITEMS.filter((it) => it.bagian >= 2 && it.bagian <= 6);
 
-    return filteredRegistry.map((reg) => {
-      const nurseFacStatuses = readNurseFacilityStatuses(reg.submittedNurseName);
-      const nurseFacCompleted = facItems.filter((it) => Boolean(nurseFacStatuses[it.code])).length;
+    return combinedEntries.map((reg) => {
+      const matchedServiceRec =
+        serviceRecordById.get(reg.id) ||
+        logbookService
+          .getAllRecords()
+          .find(
+            (sr) =>
+              sr.id === reg.id ||
+              (isMatchingNurse(sr.namaPerawat, reg.submittedNurseName) &&
+                (!reg.dateKey || sr.tanggal === reg.dateKey))
+          );
+      const isAwaitingKaruEscalation =
+        userRole === 'kepala_ruangan' && matchedServiceRec?.statusVerifikasi === 'verified_pj';
+
+      const nurseFacStatuses =
+        matchedServiceRec?.facilityStatuses &&
+        Object.keys(matchedServiceRec.facilityStatuses).length > 0
+          ? matchedServiceRec.facilityStatuses
+          : readNurseFacilityStatuses(reg.submittedNurseName);
+      const nurseFacCompleted =
+        matchedServiceRec?.items && matchedServiceRec.items.length > 0
+          ? facItems.filter((it) =>
+              Boolean(matchedServiceRec.items.find((ri) => ri.code === it.code)?.verified)
+            ).length
+          : facItems.filter((it) => Boolean(nurseFacStatuses[it.code])).length;
       // Read submitted patients from registry entry; enrich matching IDs/beds from live storage without leaking unsubmitted drafts
       let managedLookup: ManagedPatient[] = [];
       try {
@@ -743,7 +1070,10 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
         );
 
         let patStatus: PjVerificationStatus;
-        if (latestRevisionEpoch > 0 && latestRevisionEpoch >= latestSubmittedEpoch) {
+        if (isAwaitingKaruEscalation) {
+          // Untuk Kepala Ruang pada pengesahan berjenjang ('verified_pj' -> 'verified_karu'), tampilkan siap disahkan Kepala Ruang
+          patStatus = 'diajukan';
+        } else if (latestRevisionEpoch > 0 && latestRevisionEpoch >= latestSubmittedEpoch) {
           patStatus = 'belum_diajukan';
         } else if (latestSubmittedEpoch > latestRevisionEpoch) {
           const isApprovedAfterSubmit =
@@ -859,6 +1189,11 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
         }
       }
 
+      const rawItemsTotal = matchedServiceRec?.items?.length || 0;
+      const rawItemsCompleted = matchedServiceRec?.items
+        ? matchedServiceRec.items.filter((i) => Boolean(i.verified)).length
+        : 0;
+
       return {
         id: reg.id,
         nurseName: reg.submittedNurseName,
@@ -869,20 +1204,38 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
         shift: reg.shift || activeShift,
         dateKey: reg.dateKey || regDateIso,
         dateLabel: reg.dateLabel || activeDate,
-        status: effectiveStatus,
+        status: isAwaitingKaruEscalation ? 'diajukan' : effectiveStatus,
+        statusVerifikasi: matchedServiceRec?.statusVerifikasi,
+        verifikatorPjNama: matchedServiceRec?.verifikatorPjNama,
+        verifiedPjAt: matchedServiceRec?.verifiedPjAt,
         submittedAt: reg.submittedAt,
-        verifiedAt: effectiveStatus === 'terverifikasi' ? reg.verifiedAt : undefined,
-        verifiedBy: effectiveStatus === 'terverifikasi' ? reg.verifiedBy : undefined,
-        verifiedByRole: effectiveStatus === 'terverifikasi' ? reg.verifiedByRole : undefined,
+        verifiedAt:
+          !isAwaitingKaruEscalation && effectiveStatus === 'terverifikasi'
+            ? reg.verifiedAt
+            : undefined,
+        verifiedBy:
+          !isAwaitingKaruEscalation && effectiveStatus === 'terverifikasi'
+            ? reg.verifiedBy
+            : undefined,
+        verifiedByRole:
+          !isAwaitingKaruEscalation && effectiveStatus === 'terverifikasi'
+            ? reg.verifiedByRole
+            : undefined,
         pelaksanaNotes: reg.pelaksanaNotes || '',
         verifierNotes: reg.verifierNotes || '',
         facilityCompleted: nurseFacCompleted,
         facilityTotal: facItems.length,
+        rawItemsCompleted,
+        rawItemsTotal,
         patientsSummary: patientsToMap
       };
     });
   }, [
+    pendingCloudLogbooks,
+    pendingPatientSessions,
+    serviceRecords,
     registryEntries,
+    masterNurses,
     userRole,
     verifierName,
     activeShift,
@@ -915,8 +1268,80 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
       revisionEpoch: p.status === 'belum_diajukan' ? p.revisionEpoch || 0 : 0
     }));
 
-  // 1. VERIFY / APPROVE AN INDIVIDUAL PATIENT
-  const handleVerifyPatientApprove = (
+  const resolvePatientSessionCloudId = (
+    rec: RosterVerificationRecord,
+    patient: PatientVerificationDetail,
+    targetDateIso: string
+  ): string => {
+    const matchedCloud = pendingPatientSessions.find(
+      (ps) =>
+        ps.tanggal === targetDateIso &&
+        isMatchingNurse(ps.perawatPelaksana, rec.nurseName) &&
+        ((patient.medicalRecord &&
+          ps.noRm &&
+          ps.noRm.trim().toLowerCase() === patient.medicalRecord.trim().toLowerCase()) ||
+          isSameBed(ps.noBedMesin, patient.bedNumber))
+    );
+    if (matchedCloud?.id) return matchedCloud.id;
+    return buildDeterministicPatientSessionId({
+      tanggal: targetDateIso,
+      shift: rec.shift,
+      perawatPelaksana: rec.nurseName,
+      noBedMesin: patient.bedNumber,
+      noRm: patient.medicalRecord
+    });
+  };
+
+  const buildFallbackLaporanRowForVerification = (
+    rec: RosterVerificationRecord,
+    patient: PatientVerificationDetail,
+    targetDateIso: string,
+    rowIdx: number
+  ): Partial<LaporanPasienRow> => {
+    if (patient.session) {
+      return convertSessionToLaporanRow(patient.session, rowIdx, {
+        tanggalIso: targetDateIso
+      });
+    }
+    const shiftLabel: 'Pagi' | 'Siang' = rec.shift === 'Siang' ? 'Siang' : 'Pagi';
+    return {
+      no: rowIdx + 1,
+      tanggal: targetDateIso,
+      shift: shiftLabel,
+      noRm: patient.medicalRecord || '-',
+      namaPasien: patient.patientName,
+      statusRawat: 'Rawat Jalan',
+      ruangKategori: 'Reguler',
+      noBedMesin: formatBedAndMachineLabel(patient.bedNumber),
+      aksesVaskular: 'AV SHUNT',
+      waktuMulai: shiftLabel === 'Siang' ? '14:00' : '07:30',
+      waktuSelesai: shiftLabel === 'Siang' ? '18:30' : '12:00',
+      durasiJam: 4.5,
+      bbKering: 60,
+      bbPreHd: 62,
+      bbPostHd: 60,
+      qb: 220,
+      qd: 500,
+      targetUf: 2000,
+      ktV: 1.35,
+      capaianUf: 2000,
+      tdPre: '140/85',
+      tdPost: '125/80',
+      dialiser: 'High Flux (SAS HF 18)',
+      heparinisasi: 'Standar (5000 IU)',
+      komplikasiIntraHd: 'Tidak ada',
+      tindakanAdvisDpjp: 'Tidak ada',
+      statusMesin: 'Siap Pakai',
+      metodeDisinfeksi: 'Heat Clean',
+      ketTeknis: 'Normal',
+      jamCekRo: shiftLabel === 'Siang' ? '13:30' : '06:30',
+      kondisiAirRo: 'Memenuhi Syarat',
+      perawatPelaksana: rec.nurseName
+    };
+  };
+
+  // 1. VERIFY / APPROVE AN INDIVIDUAL PATIENT (ASYNC CLOUD FIRESTORE)
+  const handleVerifyPatientApprove = async (
     rec: RosterVerificationRecord,
     patient: PatientVerificationDetail,
     notes: string = '',
@@ -929,340 +1354,256 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
       return;
     }
 
-    const timestamp = formatNowWib();
-    const targetDateLabel = rec.dateLabel || activeDate;
-    const targetDateIso = rec.dateKey || indonesianDateLabelToIso(targetDateLabel);
-    const patKey = buildPatientVerificationKey(
-      rec.nurseName,
-      patient.bedNumber,
-      patient.medicalRecord,
-      targetDateIso
-    );
-    const fallbackPatKey = buildPatientVerificationKey(
-      rec.nurseName,
-      patient.bedNumber,
-      patient.medicalRecord
-    );
+    const actionKey = `${rec.id}__${patient.id}`;
+    if (verifyingKeyMap[actionKey]) return;
+    setVerifyingKeyMap((prev) => ({ ...prev, [actionKey]: true }));
+    setCloudError(null);
 
-    const effectiveSubEpoch = patient.submittedEpoch || Date.now();
-    const updateDetails = {
-      status: 'terverifikasi' as PjVerificationStatus,
-      submittedAt: patient.submittedAt || rec.submittedAt || timestamp,
-      submittedEpoch: effectiveSubEpoch,
-      verifiedAt: timestamp,
-      verifiedBy: verifierName,
-      verifiedByRole: verifierRoleLabel,
-      verifierNotes: notes || patient.verifierNotes || '',
-      revisionRequested: false,
-      revisionRequestedAt: '',
-      revisionRequestedBy: '',
-      revisionRequestedByRole: '',
-      revisionEpoch: 0,
-      score: evaluation?.score ?? patient.score ?? 95,
-      grade: evaluation?.grade ?? patient.grade ?? 'A',
-      isCorrected: evaluation?.isCorrected ?? patient.isCorrected ?? false
-    };
+    try {
+      const timestamp = formatNowWib();
+      const targetDateLabel = rec.dateLabel || activeDate;
+      const targetDateIso = rec.dateKey || indonesianDateLabelToIso(targetDateLabel);
+      const serviceRole: 'PJ Shift' | 'Kepala Ruang' =
+        userRole === 'kepala_ruangan' ? 'Kepala Ruang' : 'PJ Shift';
+      const verifikatorId = loggedInUser?.nurseId || loggedInUser?.nip || verifierName;
 
-    setPerPatientRecords((prev) => ({
-      ...prev,
-      [patKey]: updateDetails,
-      [fallbackPatKey]: updateDetails
-    }));
+      const patKey = buildPatientVerificationKey(
+        rec.nurseName,
+        patient.bedNumber,
+        patient.medicalRecord,
+        targetDateIso
+      );
+      const fallbackPatKey = buildPatientVerificationKey(
+        rec.nurseName,
+        patient.bedNumber,
+        patient.medicalRecord
+      );
 
-    if (onVerifyPatientSession) {
-      onVerifyPatientSession(
+      const effectiveSubEpoch = patient.submittedEpoch || Date.now();
+      const updateDetails = {
+        status: 'terverifikasi' as PjVerificationStatus,
+        submittedAt: patient.submittedAt || rec.submittedAt || timestamp,
+        submittedEpoch: effectiveSubEpoch,
+        verifiedAt: timestamp,
+        verifiedBy: verifierName,
+        verifiedByRole: verifierRoleLabel,
+        verifierNotes: notes || patient.verifierNotes || '',
+        revisionRequested: false,
+        revisionRequestedAt: '',
+        revisionRequestedBy: '',
+        revisionRequestedByRole: '',
+        revisionEpoch: 0,
+        score: evaluation?.score ?? patient.score ?? 95,
+        grade: evaluation?.grade ?? patient.grade ?? 'A',
+        isCorrected: evaluation?.isCorrected ?? patient.isCorrected ?? false
+      };
+
+      const patientSessionId = resolvePatientSessionCloudId(rec, patient, targetDateIso);
+      const fallbackRow = buildFallbackLaporanRowForVerification(rec, patient, targetDateIso, 0);
+
+      // Verifikasi sesi pasien di Cloud Firestore secara asinkron
+      await pasienLogbookService.verifyPatientSession(
+        patientSessionId,
+        verifikatorId,
+        serviceRole,
         {
-          bedNumber: patient.bedNumber,
-          patientName: patient.patientName,
-          medicalRecord: patient.medicalRecord
+          verifikatorNama: verifierName,
+          verifierNotes: updateDetails.verifierNotes,
+          fallbackRow
+        }
+      );
+
+      // Hapus langsung sesi pasien dari antrean state aktif secara real-time
+      setPendingPatientSessions((prev) => prev.filter((item) => item.id !== patientSessionId));
+
+      setPerPatientRecords((prev) => ({
+        ...prev,
+        [patKey]: updateDetails,
+        [fallbackPatKey]: updateDetails
+      }));
+
+      if (onVerifyPatientSession) {
+        onVerifyPatientSession(
+          {
+            bedNumber: patient.bedNumber,
+            patientName: patient.patientName,
+            medicalRecord: patient.medicalRecord
+          },
+          true,
+          {
+            verifiedAt: timestamp,
+            verifiedBy: verifierName,
+            verifiedByRole: verifierRoleLabel,
+            verifierNotes: updateDetails.verifierNotes,
+            revisionRequested: false,
+            revisionEpoch: 0,
+            nurseName: rec.nurseName,
+            shift: rec.shift,
+            dateKey: targetDateIso,
+            dateLabel: targetDateLabel
+          }
+        );
+      }
+
+      const updatedSummary = rec.patientsSummary.map((p) =>
+        p.id === patient.id || isSameBed(p.bedNumber, patient.bedNumber)
+          ? { ...p, ...updateDetails }
+          : p
+      );
+      const allPatsVerified =
+        updatedSummary.length > 0 && updatedSummary.every((p) => p.status === 'terverifikasi');
+      const nextOverallStatus: PjVerificationStatus = allPatsVerified
+        ? 'terverifikasi'
+        : 'diajukan';
+
+      if (allPatsVerified) {
+        await logbookService.verifyRecord(rec.id, verifikatorId, serviceRole, {
+          verifikatorNama: verifierName,
+          verifierNotes: updateDetails.verifierNotes
+        });
+        // Hapus langsung baris logbook yang sudah terverifikasi penuh dari antrean state real-time
+        setPendingCloudLogbooks((prev) => prev.filter((item) => item.id !== rec.id));
+      }
+
+      upsertVerificationRegistryEntry({
+        id: rec.id,
+        submittedNurseName: rec.nurseName,
+        submittedNurseNip: rec.nurseNip,
+        submittedNurseRole: rec.nurseRole,
+        targetRole: rec.targetRole,
+        targetVerifierName: rec.targetVerifierName || verifierName,
+        shift: rec.shift,
+        dateKey: targetDateIso,
+        dateLabel: targetDateLabel,
+        status: nextOverallStatus,
+        submittedAt: rec.submittedAt || timestamp,
+        verifiedAt: allPatsVerified ? timestamp : undefined,
+        verifiedBy: allPatsVerified ? verifierName : undefined,
+        verifiedByRole: allPatsVerified ? verifierRoleLabel : undefined,
+        verifierNotes: updateDetails.verifierNotes,
+        revisionRequested: false,
+        revisionEpoch: 0,
+        patients: buildRegistryPatientsPayload(updatedSummary)
+      });
+
+      syncNurseSubmissionStorage(
+        rec.nurseName,
+        {
+          status: nextOverallStatus,
+          verifiedAt: allPatsVerified ? timestamp : '',
+          verifiedBy: allPatsVerified ? verifierName : '',
+          verifiedByRole: allPatsVerified ? verifierRoleLabel : '',
+          verifierNotes: updateDetails.verifierNotes,
+          revisionRequested: false,
+          revisionRequestedAt: '',
+          revisionRequestedBy: '',
+          revisionRequestedByRole: '',
+          revisionEpoch: 0
         },
-        true,
-        {
+        [
+          {
+            patientId: patient.id,
+            bedNumber: patient.bedNumber,
+            medicalRecord: patient.medicalRecord,
+            patch: {
+              status: 'terverifikasi',
+              submittedAt: updateDetails.submittedAt,
+              submittedEpoch: effectiveSubEpoch,
+              verifiedAt: timestamp,
+              verifiedBy: verifierName,
+              verifiedByRole: verifierRoleLabel,
+              verifierNotes: updateDetails.verifierNotes,
+              revisionRequested: false,
+              revisionRequestedAt: '',
+              revisionRequestedBy: '',
+              revisionRequestedByRole: '',
+              revisionEpoch: 0
+            }
+          }
+        ]
+      );
+
+      setServiceRecords(logbookService.getAllRecords());
+      setRegistryEntries(getVerificationRegistry());
+
+      if (allPatsVerified && onVerificationUpdated) {
+        onVerificationUpdated(rec.nurseName, 'terverifikasi', {
           verifiedAt: timestamp,
           verifiedBy: verifierName,
           verifiedByRole: verifierRoleLabel,
           verifierNotes: updateDetails.verifierNotes,
           revisionRequested: false,
           revisionEpoch: 0,
-          nurseName: rec.nurseName,
           shift: rec.shift,
           dateKey: targetDateIso,
           dateLabel: targetDateLabel
-        }
+        });
+      }
+
+      showToast(
+        `Logbook pasien ${patient.patientName} (${patient.bedNumber}) telah disahkan & dikunci di Cloud.`
       );
-    }
-
-    const updatedSummary = rec.patientsSummary.map((p) =>
-      p.id === patient.id || isSameBed(p.bedNumber, patient.bedNumber)
-        ? { ...p, ...updateDetails }
-        : p
-    );
-    const allPatsVerified =
-      updatedSummary.length > 0 && updatedSummary.every((p) => p.status === 'terverifikasi');
-    const nextOverallStatus: PjVerificationStatus = allPatsVerified ? 'terverifikasi' : 'diajukan';
-
-    upsertVerificationRegistryEntry({
-      id: rec.id,
-      submittedNurseName: rec.nurseName,
-      submittedNurseNip: rec.nurseNip,
-      submittedNurseRole: rec.nurseRole,
-      targetRole: rec.targetRole,
-      targetVerifierName: rec.targetVerifierName || verifierName,
-      shift: rec.shift,
-      dateKey: targetDateIso,
-      dateLabel: targetDateLabel,
-      status: nextOverallStatus,
-      submittedAt: rec.submittedAt || timestamp,
-      verifiedAt: allPatsVerified ? timestamp : undefined,
-      verifiedBy: allPatsVerified ? verifierName : undefined,
-      verifiedByRole: allPatsVerified ? verifierRoleLabel : undefined,
-      verifierNotes: updateDetails.verifierNotes,
-      revisionRequested: false,
-      revisionEpoch: 0,
-      patients: buildRegistryPatientsPayload(updatedSummary)
-    });
-
-    syncNurseSubmissionStorage(
-      rec.nurseName,
-      {
-        status: nextOverallStatus,
-        verifiedAt: allPatsVerified ? timestamp : '',
-        verifiedBy: allPatsVerified ? verifierName : '',
-        verifiedByRole: allPatsVerified ? verifierRoleLabel : '',
-        verifierNotes: updateDetails.verifierNotes,
-        revisionRequested: false,
-        revisionRequestedAt: '',
-        revisionRequestedBy: '',
-        revisionRequestedByRole: '',
-        revisionEpoch: 0
-      },
-      [
-        {
-          patientId: patient.id,
-          bedNumber: patient.bedNumber,
-          medicalRecord: patient.medicalRecord,
-          patch: {
-            status: 'terverifikasi',
-            submittedAt: updateDetails.submittedAt,
-            submittedEpoch: effectiveSubEpoch,
-            verifiedAt: timestamp,
-            verifiedBy: verifierName,
-            verifiedByRole: verifierRoleLabel,
-            verifierNotes: updateDetails.verifierNotes,
-            revisionRequested: false,
-            revisionRequestedAt: '',
-            revisionRequestedBy: '',
-            revisionRequestedByRole: '',
-            revisionEpoch: 0
-          }
-        }
-      ]
-    );
-
-    setRegistryEntries(getVerificationRegistry());
-
-    if (allPatsVerified && onVerificationUpdated) {
-      onVerificationUpdated(rec.nurseName, 'terverifikasi', {
-        verifiedAt: timestamp,
-        verifiedBy: verifierName,
-        verifiedByRole: verifierRoleLabel,
-        verifierNotes: updateDetails.verifierNotes,
-        revisionRequested: false,
-        revisionEpoch: 0,
-        shift: rec.shift,
-        dateKey: targetDateIso,
-        dateLabel: targetDateLabel
+    } catch (err) {
+      console.error('Gagal memverifikasi logbook pasien di Cloud Firestore:', err);
+      setCloudError('Gagal menyimpan pengesahan verifikasi ke jaringan cloud. Silakan coba lagi.');
+    } finally {
+      setVerifyingKeyMap((prev) => {
+        const next = { ...prev };
+        delete next[actionKey];
+        return next;
       });
     }
-
-    showToast(`Logbook pasien ${patient.patientName} (${patient.bedNumber}) telah disahkan & dikunci.`);
   };
 
   // 2. REQUEST REPAIR / REVISE AN INDIVIDUAL PATIENT (UNLOCKS LOGBOOK FOR NURSE)
-  const handleVerifyPatientRevise = (
+  const handleVerifyPatientRevise = async (
     rec: RosterVerificationRecord,
     patient: PatientVerificationDetail,
     notes: string = '',
     evaluation?: { score?: number; grade?: string; isCorrected?: boolean }
   ) => {
-    const timestamp = formatNowWib();
-    const nowEpoch = Date.now();
-    const targetDateLabel = rec.dateLabel || activeDate;
-    const targetDateIso = rec.dateKey || indonesianDateLabelToIso(targetDateLabel);
-    const datedPatKey = buildPatientVerificationKey(
-      rec.nurseName,
-      patient.bedNumber,
-      patient.medicalRecord,
-      targetDateIso
-    );
-    const patKey = buildPatientVerificationKey(
-      rec.nurseName,
-      patient.bedNumber,
-      patient.medicalRecord
-    );
-    const effectiveNote =
-      notes.trim() ||
-      patient.verifierNotes ||
-      'Mohon periksa dan perbaiki kembali kelengkapan SPO pasien ini.';
+    const actionKey = `${rec.id}__${patient.id}`;
+    if (verifyingKeyMap[actionKey]) return;
+    setVerifyingKeyMap((prev) => ({ ...prev, [actionKey]: true }));
+    setCloudError(null);
 
-    const updateDetails = {
-      status: 'belum_diajukan' as PjVerificationStatus,
-      submittedAt: patient.submittedAt || rec.submittedAt || '',
-      submittedEpoch: 0,
-      verifiedAt: '',
-      verifiedBy: '',
-      verifiedByRole: '',
-      verifierNotes: effectiveNote,
-      revisionRequested: true,
-      revisionRequestedAt: timestamp,
-      revisionRequestedBy: verifierName,
-      revisionRequestedByRole: verifierRoleLabel,
-      revisionEpoch: nowEpoch,
-      score: evaluation?.score ?? patient.score,
-      grade: evaluation?.grade ?? patient.grade,
-      isCorrected: evaluation?.isCorrected ?? patient.isCorrected ?? false
-    };
+    try {
+      const timestamp = formatNowWib();
+      const nowEpoch = Date.now();
+      const targetDateLabel = rec.dateLabel || activeDate;
+      const targetDateIso = rec.dateKey || indonesianDateLabelToIso(targetDateLabel);
+      const serviceRole: 'PJ Shift' | 'Kepala Ruang' =
+        userRole === 'kepala_ruangan' ? 'Kepala Ruang' : 'PJ Shift';
+      const verifikatorId = loggedInUser?.nurseId || loggedInUser?.nip || verifierName;
 
-    setPerPatientRecords((prev) => ({
-      ...prev,
-      [datedPatKey]: updateDetails,
-      [patKey]: updateDetails
-    }));
-
-    if (onVerifyPatientSession) {
-      onVerifyPatientSession(
-        {
-          bedNumber: patient.bedNumber,
-          patientName: patient.patientName,
-          medicalRecord: patient.medicalRecord
-        },
-        false,
-        {
-          verifierNotes: effectiveNote,
-          revisionRequested: true,
-          revisionRequestedAt: timestamp,
-          revisionRequestedBy: verifierName,
-          revisionRequestedByRole: verifierRoleLabel,
-          revisionEpoch: nowEpoch,
-          nurseName: rec.nurseName,
-          shift: rec.shift,
-          dateKey: targetDateIso,
-          dateLabel: targetDateLabel
-        }
-      );
-    }
-
-    const updatedSummary = rec.patientsSummary.map((p) =>
-      p.id === patient.id || isSameBed(p.bedNumber, patient.bedNumber)
-        ? { ...p, ...updateDetails }
-        : p
-    );
-    const anyStillSubmittedOrVerified = updatedSummary.some(
-      (p) => p.status === 'diajukan' || p.status === 'terverifikasi'
-    );
-    const nextOverallStatus: PjVerificationStatus = anyStillSubmittedOrVerified
-      ? 'diajukan'
-      : 'belum_diajukan';
-
-    upsertVerificationRegistryEntry({
-      id: rec.id,
-      submittedNurseName: rec.nurseName,
-      submittedNurseNip: rec.nurseNip,
-      submittedNurseRole: rec.nurseRole,
-      targetRole: rec.targetRole,
-      targetVerifierName: rec.targetVerifierName || verifierName,
-      shift: rec.shift,
-      dateKey: targetDateIso,
-      dateLabel: targetDateLabel,
-      status: nextOverallStatus,
-      submittedAt: rec.submittedAt,
-      verifiedAt: '',
-      verifiedBy: '',
-      verifiedByRole: '',
-      verifierNotes: effectiveNote,
-      revisionRequested: true,
-      revisionRequestedAt: timestamp,
-      revisionRequestedBy: verifierName,
-      revisionRequestedByRole: verifierRoleLabel,
-      revisionEpoch: nowEpoch,
-      patients: buildRegistryPatientsPayload(updatedSummary)
-    });
-
-    syncNurseSubmissionStorage(
-      rec.nurseName,
-      {
-        status: nextOverallStatus,
-        verifiedAt: '',
-        verifiedBy: '',
-        verifiedByRole: '',
-        verifierNotes: effectiveNote,
-        revisionRequested: true,
-        revisionRequestedAt: timestamp,
-        revisionRequestedBy: verifierName,
-        revisionRequestedByRole: verifierRoleLabel,
-        revisionEpoch: nowEpoch,
-        declarationChecked: false
-      },
-      [
-        {
-          patientId: patient.id,
-          bedNumber: patient.bedNumber,
-          medicalRecord: patient.medicalRecord,
-          patch: {
-            status: 'belum_diajukan',
-            submittedEpoch: 0,
-            verifiedAt: '',
-            verifiedBy: '',
-            verifiedByRole: '',
-            verifierNotes: effectiveNote,
-            revisionRequested: true,
-            revisionRequestedAt: timestamp,
-            revisionRequestedBy: verifierName,
-            revisionRequestedByRole: verifierRoleLabel,
-            revisionEpoch: nowEpoch,
-            declarationChecked: false
-          }
-        }
-      ]
-    );
-
-    setRegistryEntries(getVerificationRegistry());
-
-    showToast(
-      `Permintaan perbaikan dikirim. Kunci logbook ${patient.patientName} (${patient.bedNumber}) telah dibuka untuk diedit kembali oleh ${rec.nurseName}.`
-    );
-  };
-
-  // 2a. BATCH REQUEST REPAIR FOR ALL PATIENTS OF A NURSE
-  const handleVerifyAllPatientsRevise = (rec: RosterVerificationRecord, notes: string = '') => {
-    const timestamp = formatNowWib();
-    const nowEpoch = Date.now();
-    const targetDateLabel = rec.dateLabel || activeDate;
-    const targetDateIso = rec.dateKey || indonesianDateLabelToIso(targetDateLabel);
-    const effectiveNote =
-      notes.trim() ||
-      rec.verifierNotes ||
-      'Mohon periksa dan perbaiki kembali kelengkapan logbook SPO pasien kelolaan Anda.';
-
-    const nextPerPatUpdates: typeof perPatientRecords = {};
-    const patientPatches: Array<{
-      patientId?: string;
-      bedNumber: string;
-      medicalRecord?: string;
-      patch: Partial<PjVerificationSubmission>;
-    }> = [];
-
-    const updatedSummary = rec.patientsSummary.map((p) => {
       const datedPatKey = buildPatientVerificationKey(
         rec.nurseName,
-        p.bedNumber,
-        p.medicalRecord,
+        patient.bedNumber,
+        patient.medicalRecord,
         targetDateIso
       );
-      const patKey = buildPatientVerificationKey(rec.nurseName, p.bedNumber, p.medicalRecord);
+      const patKey = buildPatientVerificationKey(
+        rec.nurseName,
+        patient.bedNumber,
+        patient.medicalRecord
+      );
+      const effectiveNote =
+        notes.trim() ||
+        patient.verifierNotes ||
+        'Mohon periksa dan perbaiki kembali kelengkapan SPO pasien ini.';
+
+      const patientSessionId = resolvePatientSessionCloudId(rec, patient, targetDateIso);
+      await pasienLogbookService.requestPatientSessionRevision(
+        patientSessionId,
+        verifikatorId,
+        serviceRole,
+        effectiveNote
+      );
+      setPendingPatientSessions((prev) => prev.filter((item) => item.id !== patientSessionId));
+
       const updateDetails = {
         status: 'belum_diajukan' as PjVerificationStatus,
-        submittedAt: p.submittedAt || rec.submittedAt || '',
+        submittedAt: patient.submittedAt || rec.submittedAt || '',
         submittedEpoch: 0,
         verifiedAt: '',
         verifiedBy: '',
@@ -1273,39 +1614,23 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
         revisionRequestedBy: verifierName,
         revisionRequestedByRole: verifierRoleLabel,
         revisionEpoch: nowEpoch,
-        score: p.score,
-        grade: p.grade,
-        isCorrected: p.isCorrected ?? false
+        score: evaluation?.score ?? patient.score,
+        grade: evaluation?.grade ?? patient.grade,
+        isCorrected: evaluation?.isCorrected ?? patient.isCorrected ?? false
       };
-      nextPerPatUpdates[datedPatKey] = updateDetails;
-      nextPerPatUpdates[patKey] = updateDetails;
 
-      patientPatches.push({
-        patientId: p.id,
-        bedNumber: p.bedNumber,
-        medicalRecord: p.medicalRecord,
-        patch: {
-          status: 'belum_diajukan',
-          submittedEpoch: 0,
-          verifiedAt: '',
-          verifiedBy: '',
-          verifiedByRole: '',
-          verifierNotes: effectiveNote,
-          revisionRequested: true,
-          revisionRequestedAt: timestamp,
-          revisionRequestedBy: verifierName,
-          revisionRequestedByRole: verifierRoleLabel,
-          revisionEpoch: nowEpoch,
-          declarationChecked: false
-        }
-      });
+      setPerPatientRecords((prev) => ({
+        ...prev,
+        [datedPatKey]: updateDetails,
+        [patKey]: updateDetails
+      }));
 
       if (onVerifyPatientSession) {
         onVerifyPatientSession(
           {
-            bedNumber: p.bedNumber,
-            patientName: p.patientName,
-            medicalRecord: p.medicalRecord
+            bedNumber: patient.bedNumber,
+            patientName: patient.patientName,
+            medicalRecord: patient.medicalRecord
           },
           false,
           {
@@ -1323,42 +1648,38 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
         );
       }
 
-      return { ...p, ...updateDetails };
-    });
+      const updatedSummary = rec.patientsSummary.map((p) =>
+        p.id === patient.id || isSameBed(p.bedNumber, patient.bedNumber)
+          ? { ...p, ...updateDetails }
+          : p
+      );
+      const anyStillSubmittedOrVerified = updatedSummary.some(
+        (p) => p.status === 'diajukan' || p.status === 'terverifikasi'
+      );
+      const nextOverallStatus: PjVerificationStatus = anyStillSubmittedOrVerified
+        ? 'diajukan'
+        : 'belum_diajukan';
 
-    setPerPatientRecords((prev) => ({
-      ...prev,
-      ...nextPerPatUpdates
-    }));
+      if (nextOverallStatus === 'belum_diajukan') {
+        await logbookService.requestRevision(rec.id, verifikatorId, serviceRole, {
+          verifikatorNama: verifierName,
+          verifierNotes: effectiveNote
+        });
+        setPendingCloudLogbooks((prev) => prev.filter((item) => item.id !== rec.id));
+      }
 
-    upsertVerificationRegistryEntry({
-      id: rec.id,
-      submittedNurseName: rec.nurseName,
-      submittedNurseNip: rec.nurseNip,
-      submittedNurseRole: rec.nurseRole,
-      targetRole: rec.targetRole,
-      targetVerifierName: rec.targetVerifierName || verifierName,
-      shift: rec.shift,
-      dateKey: targetDateIso,
-      dateLabel: targetDateLabel,
-      status: 'belum_diajukan',
-      submittedAt: rec.submittedAt,
-      verifiedAt: '',
-      verifiedBy: '',
-      verifiedByRole: '',
-      verifierNotes: effectiveNote,
-      revisionRequested: true,
-      revisionRequestedAt: timestamp,
-      revisionRequestedBy: verifierName,
-      revisionRequestedByRole: verifierRoleLabel,
-      revisionEpoch: nowEpoch,
-      patients: buildRegistryPatientsPayload(updatedSummary)
-    });
-
-    syncNurseSubmissionStorage(
-      rec.nurseName,
-      {
-        status: 'belum_diajukan',
+      upsertVerificationRegistryEntry({
+        id: rec.id,
+        submittedNurseName: rec.nurseName,
+        submittedNurseNip: rec.nurseNip,
+        submittedNurseRole: rec.nurseRole,
+        targetRole: rec.targetRole,
+        targetVerifierName: rec.targetVerifierName || verifierName,
+        shift: rec.shift,
+        dateKey: targetDateIso,
+        dateLabel: targetDateLabel,
+        status: nextOverallStatus,
+        submittedAt: rec.submittedAt,
         verifiedAt: '',
         verifiedBy: '',
         verifiedByRole: '',
@@ -1368,30 +1689,271 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
         revisionRequestedBy: verifierName,
         revisionRequestedByRole: verifierRoleLabel,
         revisionEpoch: nowEpoch,
-        declarationChecked: false
-      },
-      patientPatches
-    );
+        patients: buildRegistryPatientsPayload(updatedSummary)
+      });
 
-    if (onVerificationUpdated) {
-      onVerificationUpdated(rec.nurseName, 'belum_diajukan', {
+      syncNurseSubmissionStorage(
+        rec.nurseName,
+        {
+          status: nextOverallStatus,
+          verifiedAt: '',
+          verifiedBy: '',
+          verifiedByRole: '',
+          verifierNotes: effectiveNote,
+          revisionRequested: true,
+          revisionRequestedAt: timestamp,
+          revisionRequestedBy: verifierName,
+          revisionRequestedByRole: verifierRoleLabel,
+          revisionEpoch: nowEpoch,
+          declarationChecked: false
+        },
+        [
+          {
+            patientId: patient.id,
+            bedNumber: patient.bedNumber,
+            medicalRecord: patient.medicalRecord,
+            patch: {
+              status: 'belum_diajukan',
+              submittedEpoch: 0,
+              verifiedAt: '',
+              verifiedBy: '',
+              verifiedByRole: '',
+              verifierNotes: effectiveNote,
+              revisionRequested: true,
+              revisionRequestedAt: timestamp,
+              revisionRequestedBy: verifierName,
+              revisionRequestedByRole: verifierRoleLabel,
+              revisionEpoch: nowEpoch,
+              declarationChecked: false
+            }
+          }
+        ]
+      );
+
+      setServiceRecords(logbookService.getAllRecords());
+      setRegistryEntries(getVerificationRegistry());
+
+      showToast(
+        `Permintaan perbaikan dikirim. Kunci logbook ${patient.patientName} (${patient.bedNumber}) telah dibuka untuk diedit kembali oleh ${rec.nurseName}.`
+      );
+    } catch (err) {
+      console.error('Gagal mengirim permintaan revisi pasien ke Cloud Firestore:', err);
+      setCloudError('Gagal mengirim permintaan perbaikan ke jaringan cloud. Silakan coba lagi.');
+    } finally {
+      setVerifyingKeyMap((prev) => {
+        const next = { ...prev };
+        delete next[actionKey];
+        return next;
+      });
+    }
+  };
+
+  // 2a. BATCH REQUEST REPAIR FOR ALL PATIENTS OF A NURSE
+  const handleVerifyAllPatientsRevise = async (
+    rec: RosterVerificationRecord,
+    notes: string = ''
+  ) => {
+    const batchKey = `batch__${rec.id}`;
+    if (verifyingKeyMap[batchKey]) return;
+    setVerifyingKeyMap((prev) => ({ ...prev, [batchKey]: true }));
+    setCloudError(null);
+
+    try {
+      const timestamp = formatNowWib();
+      const nowEpoch = Date.now();
+      const targetDateLabel = rec.dateLabel || activeDate;
+      const targetDateIso = rec.dateKey || indonesianDateLabelToIso(targetDateLabel);
+      const serviceRole: 'PJ Shift' | 'Kepala Ruang' =
+        userRole === 'kepala_ruangan' ? 'Kepala Ruang' : 'PJ Shift';
+      const verifikatorId = loggedInUser?.nurseId || loggedInUser?.nip || verifierName;
+
+      const effectiveNote =
+        notes.trim() ||
+        rec.verifierNotes ||
+        'Mohon periksa dan perbaiki kembali kelengkapan logbook SPO pasien kelolaan Anda.';
+
+      const revisedSessionIds = rec.patientsSummary.map((p) =>
+        resolvePatientSessionCloudId(rec, p, targetDateIso)
+      );
+
+      await Promise.all([
+        ...revisedSessionIds.map((psId) =>
+          pasienLogbookService.requestPatientSessionRevision(
+            psId,
+            verifikatorId,
+            serviceRole,
+            effectiveNote
+          )
+        ),
+        logbookService.requestRevision(rec.id, verifikatorId, serviceRole, {
+          verifikatorNama: verifierName,
+          verifierNotes: effectiveNote
+        })
+      ]);
+
+      const revisedIdSet = new Set(revisedSessionIds);
+      setPendingPatientSessions((prev) => prev.filter((item) => !revisedIdSet.has(item.id)));
+      setPendingCloudLogbooks((prev) => prev.filter((item) => item.id !== rec.id));
+
+      const nextPerPatUpdates: typeof perPatientRecords = {};
+      const patientPatches: Array<{
+        patientId?: string;
+        bedNumber: string;
+        medicalRecord?: string;
+        patch: Partial<PjVerificationSubmission>;
+      }> = [];
+
+      const updatedSummary = rec.patientsSummary.map((p) => {
+        const datedPatKey = buildPatientVerificationKey(
+          rec.nurseName,
+          p.bedNumber,
+          p.medicalRecord,
+          targetDateIso
+        );
+        const patKey = buildPatientVerificationKey(rec.nurseName, p.bedNumber, p.medicalRecord);
+        const updateDetails = {
+          status: 'belum_diajukan' as PjVerificationStatus,
+          submittedAt: p.submittedAt || rec.submittedAt || '',
+          submittedEpoch: 0,
+          verifiedAt: '',
+          verifiedBy: '',
+          verifiedByRole: '',
+          verifierNotes: effectiveNote,
+          revisionRequested: true,
+          revisionRequestedAt: timestamp,
+          revisionRequestedBy: verifierName,
+          revisionRequestedByRole: verifierRoleLabel,
+          revisionEpoch: nowEpoch,
+          score: p.score,
+          grade: p.grade,
+          isCorrected: p.isCorrected ?? false
+        };
+        nextPerPatUpdates[datedPatKey] = updateDetails;
+        nextPerPatUpdates[patKey] = updateDetails;
+
+        patientPatches.push({
+          patientId: p.id,
+          bedNumber: p.bedNumber,
+          medicalRecord: p.medicalRecord,
+          patch: {
+            status: 'belum_diajukan',
+            submittedEpoch: 0,
+            verifiedAt: '',
+            verifiedBy: '',
+            verifiedByRole: '',
+            verifierNotes: effectiveNote,
+            revisionRequested: true,
+            revisionRequestedAt: timestamp,
+            revisionRequestedBy: verifierName,
+            revisionRequestedByRole: verifierRoleLabel,
+            revisionEpoch: nowEpoch,
+            declarationChecked: false
+          }
+        });
+
+        if (onVerifyPatientSession) {
+          onVerifyPatientSession(
+            {
+              bedNumber: p.bedNumber,
+              patientName: p.patientName,
+              medicalRecord: p.medicalRecord
+            },
+            false,
+            {
+              verifierNotes: effectiveNote,
+              revisionRequested: true,
+              revisionRequestedAt: timestamp,
+              revisionRequestedBy: verifierName,
+              revisionRequestedByRole: verifierRoleLabel,
+              revisionEpoch: nowEpoch,
+              nurseName: rec.nurseName,
+              shift: rec.shift,
+              dateKey: targetDateIso,
+              dateLabel: targetDateLabel
+            }
+          );
+        }
+
+        return { ...p, ...updateDetails };
+      });
+
+      setPerPatientRecords((prev) => ({
+        ...prev,
+        ...nextPerPatUpdates
+      }));
+
+      upsertVerificationRegistryEntry({
+        id: rec.id,
+        submittedNurseName: rec.nurseName,
+        submittedNurseNip: rec.nurseNip,
+        submittedNurseRole: rec.nurseRole,
+        targetRole: rec.targetRole,
+        targetVerifierName: rec.targetVerifierName || verifierName,
+        shift: rec.shift,
+        dateKey: targetDateIso,
+        dateLabel: targetDateLabel,
+        status: 'belum_diajukan',
+        submittedAt: rec.submittedAt,
+        verifiedAt: '',
+        verifiedBy: '',
+        verifiedByRole: '',
         verifierNotes: effectiveNote,
         revisionRequested: true,
         revisionRequestedAt: timestamp,
         revisionRequestedBy: verifierName,
         revisionRequestedByRole: verifierRoleLabel,
         revisionEpoch: nowEpoch,
-        shift: rec.shift,
-        dateKey: targetDateIso,
-        dateLabel: targetDateLabel
+        patients: buildRegistryPatientsPayload(updatedSummary)
+      });
+
+      syncNurseSubmissionStorage(
+        rec.nurseName,
+        {
+          status: 'belum_diajukan',
+          verifiedAt: '',
+          verifiedBy: '',
+          verifiedByRole: '',
+          verifierNotes: effectiveNote,
+          revisionRequested: true,
+          revisionRequestedAt: timestamp,
+          revisionRequestedBy: verifierName,
+          revisionRequestedByRole: verifierRoleLabel,
+          revisionEpoch: nowEpoch,
+          declarationChecked: false
+        },
+        patientPatches
+      );
+
+      if (onVerificationUpdated) {
+        onVerificationUpdated(rec.nurseName, 'belum_diajukan', {
+          verifierNotes: effectiveNote,
+          revisionRequested: true,
+          revisionRequestedAt: timestamp,
+          revisionRequestedBy: verifierName,
+          revisionRequestedByRole: verifierRoleLabel,
+          revisionEpoch: nowEpoch,
+          shift: rec.shift,
+          dateKey: targetDateIso,
+          dateLabel: targetDateLabel
+        });
+      }
+
+      setServiceRecords(logbookService.getAllRecords());
+      setRegistryEntries(getVerificationRegistry());
+
+      showToast(
+        `Permintaan perbaikan dikirim ke ${rec.nurseName}. Seluruh ${rec.patientsSummary.length} logbook pasien dibuka kembali untuk diperbaiki.`
+      );
+    } catch (err) {
+      console.error('Gagal mengirim revisi semua pasien ke Cloud Firestore:', err);
+      setCloudError('Gagal memproses permintaan revisi ke jaringan cloud. Silakan coba lagi.');
+    } finally {
+      setVerifyingKeyMap((prev) => {
+        const next = { ...prev };
+        delete next[batchKey];
+        return next;
       });
     }
-
-    setRegistryEntries(getVerificationRegistry());
-
-    showToast(
-      `Permintaan perbaikan dikirim ke ${rec.nurseName}. Seluruh ${rec.patientsSummary.length} logbook pasien dibuka kembali untuk diperbaiki.`
-    );
   };
 
   // 2b. SAVE PATIENT LOGBOOK EDITS & EVALUATION BY VERIFIER (PJ SHIFT / KEPALA RUANG)
@@ -1559,169 +2121,278 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
     }
   };
 
-  // 3. BATCH VERIFY SUBMITTED PATIENTS FOR A NURSE
-  const handleVerifyAllPatients = (rec: RosterVerificationRecord) => {
-    const eligiblePatients = rec.patientsSummary.filter((p) => p.status === 'diajukan');
-    if (eligiblePatients.length === 0) {
-      showToast(
-        'Tidak ada logbook berstatus Menunggu Verifikasi. Pasien yang sedang diperbaiki harus diajukan ulang oleh perawat terlebih dahulu.'
-      );
-      return;
-    }
+  // 3. BATCH VERIFY SUBMITTED PATIENTS (OR DIRECT LOGBOOK RECORD) FOR A NURSE
+  const handleVerifyAllPatients = async (rec: RosterVerificationRecord) => {
+    const batchKey = `batch__${rec.id}`;
+    if (verifyingKeyMap[batchKey]) return;
+    setVerifyingKeyMap((prev) => ({ ...prev, [batchKey]: true }));
+    setCloudError(null);
 
-    const timestamp = formatNowWib();
-    const targetDateLabel = rec.dateLabel || activeDate;
-    const targetDateIso = rec.dateKey || indonesianDateLabelToIso(targetDateLabel);
-    const nextPerPatUpdates: typeof perPatientRecords = {};
-    const patientPatches: Array<{
-      patientId?: string;
-      bedNumber: string;
-      medicalRecord?: string;
-      patch: Partial<PjVerificationSubmission>;
-    }> = [];
+    try {
+      const serviceRole: 'PJ Shift' | 'Kepala Ruang' =
+        userRole === 'kepala_ruangan' ? 'Kepala Ruang' : 'PJ Shift';
+      const verifikatorId = loggedInUser?.nurseId || loggedInUser?.nip || verifierName;
 
-    const updatedSummary = rec.patientsSummary.map((p) => {
-      if (p.status !== 'diajukan') return p;
-      const effectiveSubEpoch = p.submittedEpoch || Date.now();
-      const datedPatKey = buildPatientVerificationKey(
-        rec.nurseName,
-        p.bedNumber,
-        p.medicalRecord,
-        targetDateIso
-      );
-      const patKey = buildPatientVerificationKey(rec.nurseName, p.bedNumber, p.medicalRecord);
-      const updateDetails = {
-        status: 'terverifikasi' as PjVerificationStatus,
-        submittedAt: p.submittedAt || rec.submittedAt || timestamp,
-        submittedEpoch: effectiveSubEpoch,
-        verifiedAt: timestamp,
-        verifiedBy: verifierName,
-        verifiedByRole: verifierRoleLabel,
-        verifierNotes: p.verifierNotes || rec.verifierNotes || '',
-        revisionRequested: false,
-        revisionRequestedAt: '',
-        revisionRequestedBy: '',
-        revisionRequestedByRole: '',
-        revisionEpoch: 0
-      };
-      nextPerPatUpdates[datedPatKey] = updateDetails;
-      nextPerPatUpdates[patKey] = updateDetails;
+      // Jika logbook disimpan langsung via logbookService tanpa daftar rincian pasien, sahkan langsung lewat logbookService
+      if (rec.patientsSummary.length === 0 && rec.status === 'diajukan') {
+        const timestamp = formatNowWib();
+        const targetDateLabel = rec.dateLabel || activeDate;
+        const targetDateIso = rec.dateKey || indonesianDateLabelToIso(targetDateLabel);
 
-      patientPatches.push({
-        patientId: p.id,
-        bedNumber: p.bedNumber,
-        medicalRecord: p.medicalRecord,
-        patch: {
+        await logbookService.verifyRecord(rec.id, verifikatorId, serviceRole, {
+          verifikatorNama: verifierName,
+          verifierNotes: rec.verifierNotes || ''
+        });
+
+        // Hapus baris yang baru diverifikasi dari antrean state real-time
+        setPendingCloudLogbooks((prev) => prev.filter((item) => item.id !== rec.id));
+
+        upsertVerificationRegistryEntry({
+          id: rec.id,
+          submittedNurseName: rec.nurseName,
+          submittedNurseNip: rec.nurseNip,
+          submittedNurseRole: rec.nurseRole || 'perawat_pelaksana',
+          targetRole:
+            rec.targetRole || (userRole === 'kepala_ruangan' ? 'kepala_ruangan' : 'pj_shift'),
+          targetVerifierName: rec.targetVerifierName || verifierName,
+          shift: rec.shift,
+          dateKey: targetDateIso,
+          dateLabel: targetDateLabel,
           status: 'terverifikasi',
-          submittedAt: updateDetails.submittedAt,
+          submittedAt: rec.submittedAt || timestamp,
+          verifiedAt: timestamp,
+          verifiedBy: verifierName,
+          verifiedByRole: verifierRoleLabel,
+          verifierNotes: rec.verifierNotes || '',
+          revisionRequested: false,
+          revisionEpoch: 0
+        });
+
+        setServiceRecords(logbookService.getAllRecords());
+        setRegistryEntries(getVerificationRegistry());
+
+        if (onVerificationUpdated) {
+          onVerificationUpdated(rec.nurseName, 'terverifikasi', {
+            verifiedAt: timestamp,
+            verifiedBy: verifierName,
+            verifiedByRole: verifierRoleLabel,
+            verifierNotes: rec.verifierNotes || '',
+            revisionRequested: false,
+            revisionEpoch: 0,
+            shift: rec.shift,
+            dateKey: targetDateIso,
+            dateLabel: targetDateLabel
+          });
+        }
+
+        showToast(
+          `Logbook harian ${rec.nurseName} telah diverifikasi & disahkan oleh ${verifierRoleLabel}.`
+        );
+        return;
+      }
+
+      const eligiblePatients = rec.patientsSummary.filter((p) => p.status === 'diajukan');
+      if (eligiblePatients.length === 0) {
+        showToast(
+          'Tidak ada logbook berstatus Menunggu Verifikasi. Pasien yang sedang diperbaiki harus diajukan ulang oleh perawat terlebih dahulu.'
+        );
+        return;
+      }
+
+      const timestamp = formatNowWib();
+      const targetDateLabel = rec.dateLabel || activeDate;
+      const targetDateIso = rec.dateKey || indonesianDateLabelToIso(targetDateLabel);
+      const nextPerPatUpdates: typeof perPatientRecords = {};
+      const patientPatches: Array<{
+        patientId?: string;
+        bedNumber: string;
+        medicalRecord?: string;
+        patch: Partial<PjVerificationSubmission>;
+      }> = [];
+
+      const verifiedSessionIds: string[] = [];
+
+      // Verifikasi seluruh sesi pasien yang menunggu secara paralel di Cloud Firestore
+      await Promise.all(
+        eligiblePatients.map((p, idx) => {
+          const psId = resolvePatientSessionCloudId(rec, p, targetDateIso);
+          verifiedSessionIds.push(psId);
+          const fallbackRow = buildFallbackLaporanRowForVerification(rec, p, targetDateIso, idx);
+          return pasienLogbookService.verifyPatientSession(psId, verifikatorId, serviceRole, {
+            verifikatorNama: verifierName,
+            verifierNotes: p.verifierNotes || rec.verifierNotes || '',
+            fallbackRow
+          });
+        })
+      );
+
+      const verifiedIdSet = new Set(verifiedSessionIds);
+      setPendingPatientSessions((prev) => prev.filter((item) => !verifiedIdSet.has(item.id)));
+
+      const updatedSummary = rec.patientsSummary.map((p) => {
+        if (p.status !== 'diajukan') return p;
+        const effectiveSubEpoch = p.submittedEpoch || Date.now();
+        const datedPatKey = buildPatientVerificationKey(
+          rec.nurseName,
+          p.bedNumber,
+          p.medicalRecord,
+          targetDateIso
+        );
+        const patKey = buildPatientVerificationKey(rec.nurseName, p.bedNumber, p.medicalRecord);
+        const updateDetails = {
+          status: 'terverifikasi' as PjVerificationStatus,
+          submittedAt: p.submittedAt || rec.submittedAt || timestamp,
           submittedEpoch: effectiveSubEpoch,
           verifiedAt: timestamp,
           verifiedBy: verifierName,
           verifiedByRole: verifierRoleLabel,
-          verifierNotes: updateDetails.verifierNotes,
+          verifierNotes: p.verifierNotes || rec.verifierNotes || '',
           revisionRequested: false,
           revisionRequestedAt: '',
           revisionRequestedBy: '',
           revisionRequestedByRole: '',
           revisionEpoch: 0
-        }
-      });
+        };
+        nextPerPatUpdates[datedPatKey] = updateDetails;
+        nextPerPatUpdates[patKey] = updateDetails;
 
-      if (onVerifyPatientSession) {
-        onVerifyPatientSession(
-          {
-            bedNumber: p.bedNumber,
-            patientName: p.patientName,
-            medicalRecord: p.medicalRecord
-          },
-          true,
-          {
+        patientPatches.push({
+          patientId: p.id,
+          bedNumber: p.bedNumber,
+          medicalRecord: p.medicalRecord,
+          patch: {
+            status: 'terverifikasi',
+            submittedAt: updateDetails.submittedAt,
+            submittedEpoch: effectiveSubEpoch,
             verifiedAt: timestamp,
             verifiedBy: verifierName,
             verifiedByRole: verifierRoleLabel,
             verifierNotes: updateDetails.verifierNotes,
             revisionRequested: false,
-            revisionEpoch: 0,
-            nurseName: rec.nurseName,
-            shift: rec.shift,
-            dateKey: targetDateIso,
-            dateLabel: targetDateLabel
+            revisionRequestedAt: '',
+            revisionRequestedBy: '',
+            revisionRequestedByRole: '',
+            revisionEpoch: 0
           }
-        );
+        });
+
+        if (onVerifyPatientSession) {
+          onVerifyPatientSession(
+            {
+              bedNumber: p.bedNumber,
+              patientName: p.patientName,
+              medicalRecord: p.medicalRecord
+            },
+            true,
+            {
+              verifiedAt: timestamp,
+              verifiedBy: verifierName,
+              verifiedByRole: verifierRoleLabel,
+              verifierNotes: updateDetails.verifierNotes,
+              revisionRequested: false,
+              revisionEpoch: 0,
+              nurseName: rec.nurseName,
+              shift: rec.shift,
+              dateKey: targetDateIso,
+              dateLabel: targetDateLabel
+            }
+          );
+        }
+
+        return { ...p, ...updateDetails };
+      });
+
+      setPerPatientRecords((prev) => ({
+        ...prev,
+        ...nextPerPatUpdates
+      }));
+
+      const allVerifiedNow =
+        updatedSummary.length > 0 && updatedSummary.every((p) => p.status === 'terverifikasi');
+      const nextOverallStatus: PjVerificationStatus = allVerifiedNow
+        ? 'terverifikasi'
+        : 'diajukan';
+
+      if (allVerifiedNow) {
+        await logbookService.verifyRecord(rec.id, verifikatorId, serviceRole, {
+          verifikatorNama: verifierName,
+          verifierNotes: rec.verifierNotes || ''
+        });
+        // Hapus langsung baris logbook dari antrean verifikasi aktif secara real-time
+        setPendingCloudLogbooks((prev) => prev.filter((item) => item.id !== rec.id));
       }
 
-      return { ...p, ...updateDetails };
-    });
-
-    setPerPatientRecords((prev) => ({
-      ...prev,
-      ...nextPerPatUpdates
-    }));
-
-    const allVerifiedNow =
-      updatedSummary.length > 0 && updatedSummary.every((p) => p.status === 'terverifikasi');
-    const nextOverallStatus: PjVerificationStatus = allVerifiedNow ? 'terverifikasi' : 'diajukan';
-
-    upsertVerificationRegistryEntry({
-      id:
-        rec.id ||
-        `sub-${rec.nurseRole || 'perawat_pelaksana'}-${getNurseStorageKey(rec.nurseName)}-${targetDateIso}-${rec.shift || 'Pagi'}`,
-      submittedNurseName: rec.nurseName,
-      submittedNurseNip: rec.nurseNip,
-      submittedNurseRole: rec.nurseRole || 'perawat_pelaksana',
-      targetRole:
-        rec.targetRole || (userRole === 'kepala_ruangan' ? 'kepala_ruangan' : 'pj_shift'),
-      targetVerifierName: rec.targetVerifierName || verifierName,
-      shift: rec.shift,
-      dateKey: targetDateIso,
-      dateLabel: targetDateLabel,
-      status: nextOverallStatus,
-      submittedAt: rec.submittedAt || timestamp,
-      verifiedAt: allVerifiedNow ? timestamp : '',
-      verifiedBy: allVerifiedNow ? verifierName : '',
-      verifiedByRole: allVerifiedNow ? verifierRoleLabel : '',
-      verifierNotes: rec.verifierNotes || '',
-      revisionRequested: false,
-      revisionEpoch: 0,
-      patients: buildRegistryPatientsPayload(updatedSummary)
-    });
-
-    syncNurseSubmissionStorage(
-      rec.nurseName,
-      {
-        status: nextOverallStatus,
+      upsertVerificationRegistryEntry({
+        id:
+          rec.id ||
+          `sub-${rec.nurseRole || 'perawat_pelaksana'}-${getNurseStorageKey(rec.nurseName)}-${targetDateIso}-${rec.shift || 'Pagi'}`,
         submittedNurseName: rec.nurseName,
         submittedNurseNip: rec.nurseNip,
+        submittedNurseRole: rec.nurseRole || 'perawat_pelaksana',
+        targetRole:
+          rec.targetRole || (userRole === 'kepala_ruangan' ? 'kepala_ruangan' : 'pj_shift'),
+        targetVerifierName: rec.targetVerifierName || verifierName,
+        shift: rec.shift,
+        dateKey: targetDateIso,
+        dateLabel: targetDateLabel,
+        status: nextOverallStatus,
         submittedAt: rec.submittedAt || timestamp,
         verifiedAt: allVerifiedNow ? timestamp : '',
         verifiedBy: allVerifiedNow ? verifierName : '',
         verifiedByRole: allVerifiedNow ? verifierRoleLabel : '',
         verifierNotes: rec.verifierNotes || '',
         revisionRequested: false,
-        revisionEpoch: 0
-      },
-      patientPatches
-    );
-
-    setRegistryEntries(getVerificationRegistry());
-
-    if (allVerifiedNow && onVerificationUpdated) {
-      onVerificationUpdated(rec.nurseName, 'terverifikasi', {
-        verifiedAt: timestamp,
-        verifiedBy: verifierName,
-        verifiedByRole: verifierRoleLabel,
-        verifierNotes: rec.verifierNotes || '',
-        revisionRequested: false,
         revisionEpoch: 0,
-        shift: rec.shift,
-        dateKey: targetDateIso,
-        dateLabel: targetDateLabel
+        patients: buildRegistryPatientsPayload(updatedSummary)
+      });
+
+      syncNurseSubmissionStorage(
+        rec.nurseName,
+        {
+          status: nextOverallStatus,
+          submittedNurseName: rec.nurseName,
+          submittedNurseNip: rec.nurseNip,
+          submittedAt: rec.submittedAt || timestamp,
+          verifiedAt: allVerifiedNow ? timestamp : '',
+          verifiedBy: allVerifiedNow ? verifierName : '',
+          verifiedByRole: allVerifiedNow ? verifierRoleLabel : '',
+          verifierNotes: rec.verifierNotes || '',
+          revisionRequested: false,
+          revisionEpoch: 0
+        },
+        patientPatches
+      );
+
+      setServiceRecords(logbookService.getAllRecords());
+      setRegistryEntries(getVerificationRegistry());
+
+      if (allVerifiedNow && onVerificationUpdated) {
+        onVerificationUpdated(rec.nurseName, 'terverifikasi', {
+          verifiedAt: timestamp,
+          verifiedBy: verifierName,
+          verifiedByRole: verifierRoleLabel,
+          verifierNotes: rec.verifierNotes || '',
+          revisionRequested: false,
+          revisionEpoch: 0,
+          shift: rec.shift,
+          dateKey: targetDateIso,
+          dateLabel: targetDateLabel
+        });
+      }
+
+      showToast(
+        `${eligiblePatients.length} logbook pasien kelolaan ${rec.nurseName} telah diverifikasi & dikunci oleh ${verifierRoleLabel}.`
+      );
+    } catch (err) {
+      console.error('Gagal memverifikasi seluruh logbook pasien di Cloud Firestore:', err);
+      setCloudError('Gagal menyimpan verifikasi ke jaringan cloud. Silakan coba lagi.');
+    } finally {
+      setVerifyingKeyMap((prev) => {
+        const next = { ...prev };
+        delete next[batchKey];
+        return next;
       });
     }
-
-    showToast(
-      `${eligiblePatients.length} logbook pasien kelolaan ${rec.nurseName} telah diverifikasi & dikunci oleh ${verifierRoleLabel}.`
-    );
   };
 
   const openRevisionModal = (
@@ -1744,9 +2415,9 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
       revisionNoteInput.trim() ||
       'Mohon periksa dan perbaiki kembali kelengkapan logbook SPO sesuai standar.';
     if (patient) {
-      handleVerifyPatientRevise(rec, patient, cleanNote);
+      void handleVerifyPatientRevise(rec, patient, cleanNote);
     } else {
-      handleVerifyAllPatientsRevise(rec, cleanNote);
+      void handleVerifyAllPatientsRevise(rec, cleanNote);
     }
     setRevisionModalTarget(null);
     setRevisionNoteInput('');
@@ -1814,12 +2485,39 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
             </div>
           </div>
           <div className="flex items-center gap-2 self-start sm:self-center shrink-0 tabular-nums">
+            <button
+              type="button"
+              onClick={() => void fetchCloudVerificationQueue()}
+              disabled={isLoadingCloud}
+              className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-700 bg-white hover:bg-slate-50 disabled:opacity-60 px-3 py-1.5 rounded-xl border border-slate-300 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+              title="Muat ulang antrean verifikasi dari Cloud Firestore"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${isLoadingCloud ? 'animate-spin text-indigo-600' : 'text-slate-500'}`} />
+              <span>{isLoadingCloud ? 'Memuat Cloud...' : 'Sinkron Cloud'}</span>
+            </button>
             <span className="text-xs font-bold text-slate-700 bg-slate-100 px-3 py-1.5 rounded-xl border border-slate-200 whitespace-nowrap">
-              {queueRecords.length} Pengajuan Aktif
+              {waitingCount} Antrean Aktif
             </span>
           </div>
         </div>
       </div>
+
+      {/* Cloud Error Alert Banner */}
+      {cloudError && (
+        <div className="bg-rose-50 border border-rose-200 rounded-2xl p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-rose-900">
+          <div className="flex items-center gap-2.5">
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+            <span className="font-semibold">{cloudError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => void fetchCloudVerificationQueue()}
+            className="px-3 py-1.5 rounded-lg bg-white hover:bg-rose-100 text-rose-800 border border-rose-300 font-bold transition-colors cursor-pointer whitespace-nowrap shrink-0"
+          >
+            Coba Lagi
+          </button>
+        </div>
+      )}
 
       {/* Search & Status Filter Toolbar */}
       <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-xs flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
@@ -1841,12 +2539,12 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
         <div className="flex items-center gap-1.5 flex-wrap">
           {(
             [
-              { id: 'all', label: `Semua (${queueRecords.length})` },
               { id: 'diajukan', label: `Menunggu Verifikasi (${waitingCount})` },
-              { id: 'terverifikasi', label: `Terverifikasi (${verifiedCount})` },
+              { id: 'terverifikasi', label: `Riwayat Terverifikasi (${verifiedCount})` },
               ...(revisionCount > 0
                 ? [{ id: 'belum_diajukan' as const, label: `Perlu Revisi (${revisionCount})` }]
-                : [])
+                : []),
+              { id: 'all', label: `Semua (${queueRecords.length})` }
             ] as const
           ).map((tab) => (
             <button
@@ -1867,21 +2565,44 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
 
       {/* Verification Queue Cards */}
       <div className="space-y-4">
-        {filteredRecords.length === 0 ? (
+        {isLoadingCloud && filteredRecords.length === 0 ? (
+          <div className="bg-white rounded-2xl border border-slate-200 p-8 space-y-4">
+            <div className="flex items-center justify-center gap-2.5 text-slate-700">
+              <Loader2 className="w-5 h-5 animate-spin text-indigo-600 shrink-0" />
+              <span className="text-xs sm:text-sm font-bold">
+                Memuat antrean verifikasi real-time dari Cloud Firestore...
+              </span>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2">
+              {[1, 2, 3].map((sk) => (
+                <div
+                  key={sk}
+                  className="rounded-2xl border border-slate-200 p-4 space-y-2.5 bg-slate-50/70"
+                >
+                  <div className="h-3.5 w-28 bg-slate-200 rounded animate-pulse" />
+                  <div className="h-4 w-44 bg-slate-200 rounded animate-pulse" />
+                  <div className="h-3 w-full bg-slate-200/80 rounded animate-pulse" />
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : filteredRecords.length === 0 ? (
           <div className="bg-white rounded-2xl border border-slate-200 p-10 text-center space-y-2">
             <ClipboardCheck className="w-10 h-10 text-slate-300 mx-auto" />
             <h3 className="text-sm font-bold text-slate-800">
-              {queueRecords.length === 0
+              {statusFilter === 'diajukan'
+                ? userRole === 'kepala_ruangan'
+                  ? 'Tidak ada antrean verifikasi yang menunggu pengesahan Kepala Ruang'
+                  : `Tidak ada antrean verifikasi yang menunggu pengesahan ${verifierName}`
+                : queueRecords.length === 0
                 ? userRole === 'kepala_ruangan'
                   ? 'Belum ada pengajuan verifikasi logbook yang ditujukan kepada Kepala Ruang'
                   : `Belum ada pengajuan verifikasi logbook yang ditujukan kepada ${verifierName}`
                 : 'Tidak ada data pengajuan verifikasi yang sesuai filter'}
             </h3>
             <p className="text-xs text-slate-500 max-w-md mx-auto">
-              {queueRecords.length === 0
-                ? userRole === 'kepala_ruangan'
-                  ? 'Pengajuan dari PJ Shift atau Kepala Ruang akan otomatis muncul di halaman ini segera setelah diajukan pada Bagian VII Logbook.'
-                  : 'Pengajuan dari Perawat Pelaksana yang memilih Anda sebagai PJ Shift tujuan akan otomatis muncul di halaman ini.'
+              {statusFilter === 'diajukan'
+                ? 'Seluruh pengajuan yang disetujui otomatis berpindah keluar dari antrean aktif secara real-time. Pilih tab "Riwayat Terverifikasi" untuk melihat arsip pengesahan.'
                 : 'Ubah kata kunci pencarian atau pilih filter status lainnya.'}
             </p>
           </div>
@@ -1890,8 +2611,13 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
             const palette = NURSE_COLOR_PALETTES[nurseIdx % NURSE_COLOR_PALETTES.length];
             const patSpoCompleted = rec.patientsSummary.reduce((acc, p) => acc + p.completed, 0);
             const patSpoTotal = rec.patientsSummary.reduce((acc, p) => acc + p.total, 0);
-            const grandCompleted = rec.facilityCompleted + patSpoCompleted;
-            const grandTotal = rec.facilityTotal + patSpoTotal;
+            const hasPatientBreakdown = rec.patientsSummary.length > 0;
+            const grandCompleted = hasPatientBreakdown
+              ? rec.facilityCompleted + patSpoCompleted
+              : rec.rawItemsCompleted || rec.facilityCompleted;
+            const grandTotal = hasPatientBreakdown
+              ? rec.facilityTotal + patSpoTotal
+              : rec.rawItemsTotal || OFFICIAL_LOGBOOK_ITEMS.length;
             const grandPct = grandTotal > 0 ? Math.round((grandCompleted / grandTotal) * 100) : 0;
             const verifiedPatientsCount = rec.patientsSummary.filter(
               (p) => p.status === 'terverifikasi'
@@ -1903,10 +2629,17 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
             const revisablePatientsCount = rec.patientsSummary.filter(
               (p) => p.status === 'diajukan' || p.status === 'terverifikasi'
             ).length;
+            const canApproveDirect = !hasPatientBreakdown && rec.status === 'diajukan';
+            const canReviseDirect =
+              !hasPatientBreakdown && (rec.status === 'diajukan' || rec.status === 'terverifikasi');
+            const isVerifiedByPjPendingKaru =
+              userRole === 'kepala_ruangan' && rec.statusVerifikasi === 'verified_pj';
 
             const targetDisplay =
               rec.targetRole === 'kepala_ruangan' || rec.targetRole === 'mandiri'
                 ? `Tujuan Kepala Ruang: ${rec.targetVerifierName}`
+                : isVerifiedByPjPendingKaru
+                ? `Diverifikasi PJ Shift (${rec.verifikatorPjNama || 'PJ Shift'}) · Pengesahan Kepala Ruang`
                 : `Tujuan PJ Shift: ${rec.targetVerifierName}`;
 
             return (
@@ -1945,6 +2678,8 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
                           <span>
                             {rec.status === 'terverifikasi'
                               ? 'Terverifikasi (Terkunci)'
+                              : isVerifiedByPjPendingKaru
+                              ? 'Disahkan PJ Shift · Menunggu Pengesahan Ka. Ruang'
                               : rec.status === 'diajukan'
                               ? 'Menunggu Verifikasi (Dapat Diedit Verifikator)'
                               : 'Menunggu Perbaikan Perawat'}
@@ -1954,10 +2689,14 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
                         <span>Shift {rec.shift}</span>
                         <span aria-hidden="true">&middot;</span>
                         <span>{formatSubmitterRoleLabel(rec.nurseRole)}</span>
-                        <span aria-hidden="true">&middot;</span>
-                        <span className="font-semibold text-slate-700">
-                          {verifiedPatientsCount} dari {rec.patientsSummary.length} Pasien Disahkan
-                        </span>
+                        {hasPatientBreakdown && (
+                          <>
+                            <span aria-hidden="true">&middot;</span>
+                            <span className="font-semibold text-slate-700">
+                              {verifiedPatientsCount} dari {rec.patientsSummary.length} Pasien Disahkan
+                            </span>
+                          </>
+                        )}
                       </div>
 
                       <h3 className={`text-base sm:text-lg tracking-tight font-black ${palette.nameColor}`}>
@@ -2000,15 +2739,18 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
                     </div>
                     <div className="text-xs text-slate-500 text-left md:text-right">
                       Bagian I: {rec.facilityCompleted}/{rec.facilityTotal} &middot;{' '}
-                      {rec.patientsSummary.length} Pasien Kelolaan
+                      {hasPatientBreakdown
+                        ? `${rec.patientsSummary.length} Pasien Kelolaan`
+                        : `${grandCompleted} Poin SPO Tercatat`}
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2 mt-1 self-start md:self-end">
-                      {revisablePatientsCount > 0 && (
+                      {(revisablePatientsCount > 0 || canReviseDirect) && (
                         <button
                           type="button"
+                          disabled={Boolean(verifyingKeyMap[`batch__${rec.id}`])}
                           onClick={() => openRevisionModal(rec)}
-                          className="px-3 py-2 bg-white hover:bg-amber-50 text-amber-800 border border-amber-300 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
+                          className="px-3 py-2 bg-white hover:bg-amber-50 disabled:opacity-60 text-amber-800 border border-amber-300 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
                           title="Minta perawat memperbaiki kembali seluruh logbook pasien ini (membuka kunci edit)"
                         >
                           <RotateCcw className="w-3.5 h-3.5 shrink-0" />
@@ -2016,15 +2758,30 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
                         </button>
                       )}
 
-                      {waitingPatientsCount > 0 && (
+                      {(waitingPatientsCount > 0 || canApproveDirect) && (
                         <button
                           type="button"
-                          onClick={() => handleVerifyAllPatients(rec)}
-                          className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer shadow-2xs whitespace-nowrap shrink-0"
-                          title="Verifikasi seluruh pasien berstatus Menunggu Verifikasi sekaligus"
+                          disabled={Boolean(verifyingKeyMap[`batch__${rec.id}`])}
+                          onClick={() => void handleVerifyAllPatients(rec)}
+                          className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 cursor-pointer shadow-2xs whitespace-nowrap shrink-0"
+                          title="Setujui & verifikasi seluruh logbook berstatus Menunggu Verifikasi sekaligus ke Cloud Firestore"
                         >
-                          <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
-                          <span>Sahkan Pasien ({waitingPatientsCount})</span>
+                          {verifyingKeyMap[`batch__${rec.id}`] ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                          ) : (
+                            <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                          )}
+                          <span>
+                            {verifyingKeyMap[`batch__${rec.id}`]
+                              ? 'Memverifikasi...'
+                              : hasPatientBreakdown
+                              ? isVerifiedByPjPendingKaru
+                                ? `Setujui Ka. Ruang (${waitingPatientsCount})`
+                                : `Setujui & Verifikasi (${waitingPatientsCount})`
+                              : isVerifiedByPjPendingKaru
+                              ? 'Setujui Logbook (Ka. Ruang)'
+                              : 'Setujui & Verifikasi'}
+                          </span>
                         </button>
                       )}
                     </div>
@@ -2159,8 +2916,9 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
                                 <>
                                   <button
                                     type="button"
+                                    disabled={Boolean(verifyingKeyMap[`${rec.id}__${pat.id}`])}
                                     onClick={() => openRevisionModal(rec, pat)}
-                                    className="px-2.5 py-1.5 rounded-xl bg-white hover:bg-amber-50 text-amber-800 border border-amber-300 text-[11px] font-bold transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0"
+                                    className="px-2.5 py-1.5 rounded-xl bg-white hover:bg-amber-50 disabled:opacity-60 text-amber-800 border border-amber-300 text-[11px] font-bold transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap shrink-0"
                                     title="Kembalikan logbook ke perawat pengaju untuk diperbaiki kembali"
                                   >
                                     <RotateCcw className="w-3 h-3 shrink-0" />
@@ -2168,12 +2926,21 @@ export const VerifikasiView: React.FC<VerifikasiViewProps> = ({
                                   </button>
                                   <button
                                     type="button"
-                                    onClick={() => handleVerifyPatientApprove(rec, pat)}
-                                    className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] flex items-center gap-1 transition-colors cursor-pointer shadow-2xs whitespace-nowrap shrink-0"
-                                    title="Verifikasi & sahkan logbook pasien ini"
+                                    disabled={Boolean(verifyingKeyMap[`${rec.id}__${pat.id}`])}
+                                    onClick={() => void handleVerifyPatientApprove(rec, pat)}
+                                    className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white font-bold text-[11px] flex items-center gap-1 transition-colors cursor-pointer shadow-2xs whitespace-nowrap shrink-0"
+                                    title="Setujui & verifikasi logbook pasien ini ke Cloud Firestore"
                                   >
-                                    <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
-                                    <span>Sahkan</span>
+                                    {verifyingKeyMap[`${rec.id}__${pat.id}`] ? (
+                                      <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                                    ) : (
+                                      <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                                    )}
+                                    <span>
+                                      {verifyingKeyMap[`${rec.id}__${pat.id}`]
+                                        ? 'Memproses...'
+                                        : 'Setujui'}
+                                    </span>
                                   </button>
                                 </>
                               ) : (

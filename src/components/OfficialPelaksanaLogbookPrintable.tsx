@@ -62,7 +62,7 @@ export const OfficialPelaksanaLogbookPrintable: React.FC<OfficialPelaksanaLogboo
     : daysArray.reduce((acc, _, dayIdx) => {
         const dailyCount = computeDailyActivitiesCount(logbook.checks, dayIdx);
         return dailyCount > 0 ? acc + 1 : acc;
-      }, 0) || 20;
+      }, 0);
 
   const totalVerifiedPatients = dailyPatCounts.reduce((a, b) => a + b, 0);
 

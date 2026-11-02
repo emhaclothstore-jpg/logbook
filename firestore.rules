@@ -111,6 +111,7 @@ service cloud.firestore {
         && (!('shift' in data) || data.shift == null || isBoundedString(data.shift, 32))
         && (!('role' in data) || data.role == null || isBoundedString(data.role, 32))
         && (!('spesialisasi' in data) || data.spesialisasi == null || isBoundedString(data.spesialisasi, 300))
+        && (!('phone' in data) || data.phone == null || isBoundedString(data.phone, 64))
         && (!('notes' in data) || data.notes == null || isBoundedString(data.notes, 2000))
         && (!('updatedAt' in data) || data.updatedAt == null || isBoundedString(data.updatedAt, 128));
     }
@@ -118,6 +119,49 @@ service cloud.firestore {
     function isValidVerificationRegistry(data) {
       return data.keys().size() <= 300
         && (!('entries' in data) || data.entries == null || (data.entries is list && data.entries.size() <= 10000))
+        && (!('updatedAt' in data) || data.updatedAt == null || isBoundedString(data.updatedAt, 128));
+    }
+
+    function isValidLogbookRecord(data) {
+      return data.keys().size() <= 300
+        && (!('id' in data) || data.id == null || isBoundedString(data.id, 128))
+        && (!('tanggal' in data) || data.tanggal == null || isBoundedString(data.tanggal, 32))
+        && (!('tanggalLabel' in data) || data.tanggalLabel == null || isBoundedString(data.tanggalLabel, 128))
+        && (!('shift' in data) || data.shift == null || isBoundedString(data.shift, 32))
+        && (!('perawatId' in data) || data.perawatId == null || isBoundedString(data.perawatId, 128))
+        && (!('namaPerawat' in data) || data.namaPerawat == null || isBoundedString(data.namaPerawat, 300))
+        && (!('nipPerawat' in data) || data.nipPerawat == null || isBoundedString(data.nipPerawat, 64))
+        && (!('statusVerifikasi' in data) || data.statusVerifikasi == null || (data.statusVerifikasi is string && data.statusVerifikasi in ['draft', 'submitted', 'verified_pj', 'verified_karu']))
+        && (!('verifikatorPjId' in data) || data.verifikatorPjId == null || isBoundedString(data.verifikatorPjId, 300))
+        && (!('verifikatorPjNama' in data) || data.verifikatorPjNama == null || isBoundedString(data.verifikatorPjNama, 300))
+        && (!('verifikatorKaruId' in data) || data.verifikatorKaruId == null || isBoundedString(data.verifikatorKaruId, 300))
+        && (!('verifikatorKaruNama' in data) || data.verifikatorKaruNama == null || isBoundedString(data.verifikatorKaruNama, 300))
+        && (!('pelaksanaNotes' in data) || data.pelaksanaNotes == null || isBoundedString(data.pelaksanaNotes, 5000))
+        && (!('verifierNotes' in data) || data.verifierNotes == null || isBoundedString(data.verifierNotes, 5000))
+        && (!('items' in data) || data.items == null || (data.items is list && data.items.size() <= 100))
+        && (!('patients' in data) || data.patients == null || (data.patients is list && data.patients.size() <= 500))
+        && (!('sessionsSnapshot' in data) || data.sessionsSnapshot == null || (data.sessionsSnapshot is list && data.sessionsSnapshot.size() <= 500))
+        && (!('updatedAt' in data) || data.updatedAt == null || isBoundedString(data.updatedAt, 128));
+    }
+
+    function isValidPatientSessionReport(data) {
+      return data.keys().size() <= 200
+        && (!('id' in data) || data.id == null || isBoundedString(data.id, 128))
+        && (!('tanggal' in data) || data.tanggal == null || isBoundedString(data.tanggal, 32))
+        && (!('shift' in data) || data.shift == null || isBoundedString(data.shift, 32))
+        && (!('noRm' in data) || data.noRm == null || isBoundedString(data.noRm, 64))
+        && (!('namaPasien' in data) || data.namaPasien == null || isBoundedString(data.namaPasien, 300))
+        && (!('statusRawat' in data) || data.statusRawat == null || isBoundedString(data.statusRawat, 64))
+        && (!('ruangKategori' in data) || data.ruangKategori == null || isBoundedString(data.ruangKategori, 128))
+        && (!('noBedMesin' in data) || data.noBedMesin == null || isBoundedString(data.noBedMesin, 128))
+        && (!('aksesVaskular' in data) || data.aksesVaskular == null || isBoundedString(data.aksesVaskular, 128))
+        && (!('perawatPelaksana' in data) || data.perawatPelaksana == null || isBoundedString(data.perawatPelaksana, 300))
+        && (!('statusVerifikasi' in data) || data.statusVerifikasi == null || (data.statusVerifikasi is string && data.statusVerifikasi in ['draft', 'submitted', 'verified_pj', 'verified_karu']))
+        && (!('verifikatorPjId' in data) || data.verifikatorPjId == null || isBoundedString(data.verifikatorPjId, 300))
+        && (!('verifikatorKaruId' in data) || data.verifikatorKaruId == null || isBoundedString(data.verifikatorKaruId, 300))
+        && (!('komplikasiIntraHd' in data) || data.komplikasiIntraHd == null || isBoundedString(data.komplikasiIntraHd, 2000))
+        && (!('tindakanAdvisDpjp' in data) || data.tindakanAdvisDpjp == null || isBoundedString(data.tindakanAdvisDpjp, 2000))
+        && (!('verifierNotes' in data) || data.verifierNotes == null || isBoundedString(data.verifierNotes, 2000))
         && (!('updatedAt' in data) || data.updatedAt == null || isBoundedString(data.updatedAt, 128));
     }
 
@@ -199,6 +243,22 @@ service cloud.firestore {
       allow list: if true;
       allow create, update: if isValidId(regId) && isValidVerificationRegistry(incoming());
       allow delete: if isValidId(regId);
+    }
+
+    // Cloud Logbook Harian Perawat (antrean verifikasi PJ Shift / Karu & laporan terverifikasi)
+    match /logbooks/{logbookId} {
+      allow get: if isValidId(logbookId);
+      allow list: if true;
+      allow create, update: if isValidId(logbookId) && isValidLogbookRecord(incoming());
+      allow delete: if isValidId(logbookId);
+    }
+
+    // Cloud Sesi Klinis Pasien HD (antrean verifikasi & laporan pasien terverifikasi Karu)
+    match /patient_sessions/{sessionId} {
+      allow get: if isValidId(sessionId);
+      allow list: if true;
+      allow create, update: if isValidId(sessionId) && isValidPatientSessionReport(incoming());
+      allow delete: if isValidId(sessionId);
     }
 
     // Connection health check document

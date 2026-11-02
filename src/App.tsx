@@ -42,7 +42,8 @@ import {
 import {
   initialNurseSchedules,
   initialDoctorSchedules,
-  ensureAllOfficialDoctorSchedules
+  ensureAllOfficialDoctorSchedules,
+  scheduleService
 } from './data/mockScheduleData.ts';
 import {
   resolveNurseMatrixShiftForDate,
@@ -541,10 +542,12 @@ export default function App() {
           saveNurseSchedulesCloud(cleanedCloud).catch(() => {});
         }
 
-        if (nurseSchedulesDirtyRef.current) {
-          setNurseSchedules((prevLocal) => mergeNurseSchedules(prevLocal, cleanedCloud));
-        } else {
-          setNurseSchedules(cleanedCloud);
+        if (cleanedCloud.length > 0) {
+          setNurseSchedules((prevLocal) =>
+            nurseSchedulesDirtyRef.current
+              ? mergeNurseSchedules(prevLocal, cleanedCloud)
+              : mergeNurseSchedules(cleanedCloud, prevLocal)
+          );
         }
       }
     });
@@ -559,18 +562,52 @@ export default function App() {
           saveDoctorSchedulesCloud(cleanedCloudDocs).catch(() => {});
         }
 
-        if (doctorSchedulesDirtyRef.current) {
-          setDoctorSchedules((prevLocal) => mergeDoctorSchedules(prevLocal, cleanedCloudDocs));
-        } else {
-          setDoctorSchedules(cleanedCloudDocs);
+        if (cleanedCloudDocs.length > 0) {
+          setDoctorSchedules((prevLocal) =>
+            doctorSchedulesDirtyRef.current
+              ? mergeDoctorSchedules(prevLocal, cleanedCloudDocs)
+              : mergeDoctorSchedules(cleanedCloudDocs, prevLocal)
+          );
         }
       }
     });
+
+    const unsubCloudNurseCol = scheduleService.subscribeAllNurseSchedules(
+      (entries, isInitialized) => {
+        nurseSchedulesCloudLoadedRef.current = true;
+        if (!isInitialized) return;
+        const cleaned = stripLegacySyntheticSchedules(entries);
+        setNurseSchedules((prevLocal) =>
+          nurseSchedulesDirtyRef.current
+            ? mergeNurseSchedules(prevLocal, cleaned)
+            : cleaned.length > 0
+            ? mergeNurseSchedules(prevLocal, cleaned)
+            : prevLocal
+        );
+      }
+    );
+
+    const unsubCloudDoctorCol = scheduleService.subscribeAllDoctorSchedules(
+      (entries, isInitialized) => {
+        doctorSchedulesCloudLoadedRef.current = true;
+        if (!isInitialized) return;
+        const cleaned = stripLegacySyntheticSchedules(entries);
+        setDoctorSchedules((prevLocal) =>
+          doctorSchedulesDirtyRef.current
+            ? mergeDoctorSchedules(prevLocal, cleaned)
+            : cleaned.length > 0
+            ? mergeDoctorSchedules(prevLocal, cleaned)
+            : prevLocal
+        );
+      }
+    );
 
     return () => {
       unsubNurses();
       unsubN();
       unsubD();
+      unsubCloudNurseCol();
+      unsubCloudDoctorCol();
     };
   }, []);
 
@@ -729,11 +766,14 @@ export default function App() {
     // Otomatis memperbarui matriks jadwal bulanan perawat (hak akses Administrator)
     // saat perawat pelaksana, pj shift, maupun kepala ruang melakukan perubahan jadwal
     if (loggedInUser?.name) {
-      const currentNurse =
+      const currentNurse: MasterNurse =
         masterNurses.find((n) => loggedInUser.nurseId && n.id === loggedInUser.nurseId) ||
         masterNurses.find((n) => isMatchingNurse(n.name, loggedInUser.name)) || {
           id: loggedInUser.nurseId || `nurse-${loggedInUser.name.toLowerCase().replace(/\s+/g, '-')}`,
           name: loggedInUser.name,
+          nip: loggedInUser.nip || '-',
+          pernefriCertified: true,
+          isOnDutyToday: true,
           role:
             userRole === 'kepala_ruangan'
               ? 'kepala_ruangan'
@@ -2259,7 +2299,6 @@ export default function App() {
             doctorSchedules={doctorSchedules}
             loggedInUser={loggedInUser}
             userRole={userRole}
-            onUpdateNurseSchedules={handleUpdateNurseSchedules}
             onShiftChange={handleLogbookShiftChange}
             onDateChange={handleActiveDateChange}
             isCustomDate={isDateCustomFromToday}
