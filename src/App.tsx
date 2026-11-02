@@ -49,7 +49,10 @@ import {
   resolvePjShiftEntryFromMatrix,
   resolveScheduledDoctorsFromMatrix,
   mergeNurseSchedules,
-  mergeDoctorSchedules
+  mergeDoctorSchedules,
+  stripLegacySyntheticSchedules,
+  applyNurseMatrixCell,
+  NurseMatrixCode
 } from './utils/monthlyScheduleMatrixHelpers.ts';
 import {
   computeCensusAndAccess,
@@ -393,88 +396,123 @@ export default function App() {
     saveMasterDoctorsCloud(masterDoctors).catch(() => {});
   }, [masterDoctors]);
 
+  const NURSE_SCHEDULES_STORAGE_KEY = 'dialysis_nurse_schedules_v3_clean';
+  const DOCTOR_SCHEDULES_STORAGE_KEY = 'dialysis_doctor_schedules_v8_clean';
+
   const [nurseSchedules, setNurseSchedules] = useState<NurseScheduleEntry[]>(() => {
     try {
-      const primaryKey = 'dialysis_nurse_schedules_v2_monthly';
-      const rawCurrent = localStorage.getItem(primaryKey);
+      // Purge obsolete legacy storage keys that held synthetic mock data
+      const obsoleteKeys = [
+        'dialysis_nurse_schedules_v2_monthly',
+        'dialysis_nurse_schedules_v1'
+      ];
+      obsoleteKeys.forEach((k) => {
+        try { localStorage.removeItem(k); } catch {}
+      });
+
+      const rawCurrent = localStorage.getItem(NURSE_SCHEDULES_STORAGE_KEY);
       if (rawCurrent) {
         const parsed = JSON.parse(rawCurrent);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed as NurseScheduleEntry[];
-        }
-      }
-      const legacyV1 = localStorage.getItem('dialysis_nurse_schedules_v1');
-      if (legacyV1) {
-        const parsedLegacy = JSON.parse(legacyV1);
-        if (Array.isArray(parsedLegacy) && parsedLegacy.length > 0) {
-          const merged = mergeNurseSchedules(initialNurseSchedules, parsedLegacy as NurseScheduleEntry[]);
-          localStorage.setItem(primaryKey, JSON.stringify(merged));
-          return merged;
+          return stripLegacySyntheticSchedules(parsed as NurseScheduleEntry[]);
         }
       }
     } catch {
       // ignore
     }
-    return initialNurseSchedules;
+    return [];
   });
 
   const [doctorSchedules, setDoctorSchedules] = useState<DoctorScheduleEntry[]>(() => {
     try {
-      const primaryKey = 'dialysis_doctor_schedules_v7_clean';
-      const persistedMonthly = localStorage.getItem(primaryKey);
-      if (persistedMonthly) {
-        const parsed = JSON.parse(persistedMonthly);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed as DoctorScheduleEntry[];
-        }
-      }
-
-      // Check legacy storage keys to recover previously entered doctor schedules
-      const legacyKeys = [
+      // Purge obsolete legacy storage keys that held synthetic mock data
+      const obsoleteKeys = [
+        'dialysis_doctor_schedules_v7_clean',
         'dialysis_doctor_schedules_v5_monthly',
         'dialysis_doctor_schedules_v4_13',
         'dialysis_doctor_schedules_v2',
         'dialysis_doctor_schedules_v1'
       ];
-      for (const key of legacyKeys) {
-        const raw = localStorage.getItem(key);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            localStorage.setItem(primaryKey, JSON.stringify(parsed));
-            return parsed as DoctorScheduleEntry[];
-          }
+      obsoleteKeys.forEach((k) => {
+        try { localStorage.removeItem(k); } catch {}
+      });
+
+      const persistedMonthly = localStorage.getItem(DOCTOR_SCHEDULES_STORAGE_KEY);
+      if (persistedMonthly) {
+        const parsed = JSON.parse(persistedMonthly);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return stripLegacySyntheticSchedules(parsed as DoctorScheduleEntry[]);
         }
       }
     } catch {
       // ignore
     }
-    return initialDoctorSchedules;
+    return [];
   });
 
-  // Debounced cloud save for Nurse Schedules (immediate localStorage, 800ms debounced Firestore write)
+  // Track initial cloud fetch completion and local mutations to prevent race-condition wipes
+  const nurseSchedulesCloudLoadedRef = React.useRef(false);
+  const doctorSchedulesCloudLoadedRef = React.useRef(false);
+  const nurseSchedulesDirtyRef = React.useRef(false);
+  const doctorSchedulesDirtyRef = React.useRef(false);
+
+  const handleUpdateNurseSchedules: React.Dispatch<React.SetStateAction<NurseScheduleEntry[]>> = React.useCallback(
+    (action) => {
+      nurseSchedulesDirtyRef.current = true;
+      setNurseSchedules(action);
+    },
+    []
+  );
+
+  const handleUpdateDoctorSchedules: React.Dispatch<React.SetStateAction<DoctorScheduleEntry[]>> = React.useCallback(
+    (action) => {
+      doctorSchedulesDirtyRef.current = true;
+      setDoctorSchedules(action);
+    },
+    []
+  );
+
+  // Debounced cloud save for Nurse Schedules (immediate localStorage, 600ms debounced Firestore write)
   useEffect(() => {
     try {
-      localStorage.setItem('dialysis_nurse_schedules_v2_monthly', JSON.stringify(nurseSchedules));
+      localStorage.setItem(NURSE_SCHEDULES_STORAGE_KEY, JSON.stringify(nurseSchedules));
     } catch {
-      // ignore
+      // ignore storage quota errors
+    }
+    // CRITICAL: NEVER overwrite cloud before initial cloud snapshot has loaded!
+    // And only push if user made local mutations (dirty) to avoid cyclic re-uploads
+    if (!nurseSchedulesCloudLoadedRef.current || !nurseSchedulesDirtyRef.current) {
+      return;
     }
     const timer = setTimeout(() => {
-      saveNurseSchedulesCloud(nurseSchedules).catch(() => {});
-    }, 800);
+      saveNurseSchedulesCloud(nurseSchedules)
+        .then(() => {
+          nurseSchedulesDirtyRef.current = false;
+        })
+        .catch(() => {});
+    }, 600);
     return () => clearTimeout(timer);
   }, [nurseSchedules]);
 
-  // Debounced cloud save for Doctor Schedules (immediate localStorage, 800ms debounced Firestore write)
+  // Debounced cloud save for Doctor Schedules (immediate localStorage, 600ms debounced Firestore write)
   useEffect(() => {
     try {
-      localStorage.setItem('dialysis_doctor_schedules_v7_clean', JSON.stringify(doctorSchedules));
+      localStorage.setItem(DOCTOR_SCHEDULES_STORAGE_KEY, JSON.stringify(doctorSchedules));
     } catch {
-      // ignore
+      // ignore storage quota errors
+    }
+    // CRITICAL: NEVER overwrite cloud before initial cloud snapshot has loaded!
+    // And only push if user made local mutations (dirty) to avoid cyclic re-uploads
+    if (!doctorSchedulesCloudLoadedRef.current || !doctorSchedulesDirtyRef.current) {
+      return;
     }
     const timer = setTimeout(() => {
-      saveDoctorSchedulesCloud(doctorSchedules).catch(() => {});
-    }, 800);
+      saveDoctorSchedulesCloud(doctorSchedules)
+        .then(() => {
+          doctorSchedulesDirtyRef.current = false;
+        })
+        .catch(() => {});
+    }, 600);
     return () => clearTimeout(timer);
   }, [doctorSchedules]);
 
@@ -492,16 +530,43 @@ export default function App() {
         setMasterNurses(uniqueNurses);
       }
     });
+
     const unsubN = subscribeToNurseSchedules((cloudSchedules) => {
-      if (Array.isArray(cloudSchedules) && cloudSchedules.length > 0) {
-        setNurseSchedules((prevLocal) => mergeNurseSchedules(prevLocal, cloudSchedules));
+      nurseSchedulesCloudLoadedRef.current = true;
+      if (Array.isArray(cloudSchedules)) {
+        const cleanedCloud = stripLegacySyntheticSchedules(cloudSchedules);
+
+        // If cloud contains old synthetic mock data, cleanse cloud document once
+        if (cleanedCloud.length !== cloudSchedules.length) {
+          saveNurseSchedulesCloud(cleanedCloud).catch(() => {});
+        }
+
+        if (nurseSchedulesDirtyRef.current) {
+          setNurseSchedules((prevLocal) => mergeNurseSchedules(prevLocal, cleanedCloud));
+        } else {
+          setNurseSchedules(cleanedCloud);
+        }
       }
     });
+
     const unsubD = subscribeToDoctorSchedules((cloudDocs) => {
-      if (Array.isArray(cloudDocs) && cloudDocs.length > 0) {
-        setDoctorSchedules((prevLocal) => mergeDoctorSchedules(prevLocal, cloudDocs));
+      doctorSchedulesCloudLoadedRef.current = true;
+      if (Array.isArray(cloudDocs)) {
+        const cleanedCloudDocs = stripLegacySyntheticSchedules(cloudDocs);
+
+        // If cloud contains old synthetic mock data, cleanse cloud document once
+        if (cleanedCloudDocs.length !== cloudDocs.length) {
+          saveDoctorSchedulesCloud(cleanedCloudDocs).catch(() => {});
+        }
+
+        if (doctorSchedulesDirtyRef.current) {
+          setDoctorSchedules((prevLocal) => mergeDoctorSchedules(prevLocal, cleanedCloudDocs));
+        } else {
+          setDoctorSchedules(cleanedCloudDocs);
+        }
       }
     });
+
     return () => {
       unsubNurses();
       unsubN();
@@ -642,7 +707,10 @@ export default function App() {
     }));
   };
 
-  const handleLogbookShiftChange = (nextShift: 'Pagi' | 'Siang') => {
+  const handleLogbookShiftChange = (
+    nextShift: 'Pagi' | 'Siang',
+    explicitCode?: NurseMatrixCode
+  ) => {
     const nextShiftHours =
       nextShift === 'Siang'
         ? 'Siang, jam 14.00 - 21.00 WIB'
@@ -657,6 +725,40 @@ export default function App() {
     const activeIso = isCustomDate
       ? indonesianDateLabelToIso(shiftInfo.date) || getCurrentIsoDateWib()
       : getCurrentIsoDateWib();
+
+    // Otomatis memperbarui matriks jadwal bulanan perawat (hak akses Administrator)
+    // saat perawat pelaksana, pj shift, maupun kepala ruang melakukan perubahan jadwal
+    if (loggedInUser?.name) {
+      const currentNurse =
+        masterNurses.find((n) => loggedInUser.nurseId && n.id === loggedInUser.nurseId) ||
+        masterNurses.find((n) => isMatchingNurse(n.name, loggedInUser.name)) || {
+          id: loggedInUser.nurseId || `nurse-${loggedInUser.name.toLowerCase().replace(/\s+/g, '-')}`,
+          name: loggedInUser.name,
+          role:
+            userRole === 'kepala_ruangan'
+              ? 'kepala_ruangan'
+              : userRole === 'pj_shift'
+              ? 'pj_shift'
+              : 'perawat_pelaksana'
+        };
+
+      const resolvedRole = userRole || resolveNurseSystemAccess(currentNurse);
+      let targetCode: NurseMatrixCode = explicitCode || (nextShift === 'Siang' ? 'S' : 'P');
+      if (!explicitCode && resolvedRole === 'pj_shift') {
+        targetCode = nextShift === 'Siang' ? 'PJ-S' : 'PJ-P';
+      }
+
+      handleUpdateNurseSchedules((prevSchedules) =>
+        applyNurseMatrixCell(
+          prevSchedules,
+          currentNurse,
+          activeIso,
+          targetCode,
+          `Dirubah via sistem oleh ${loggedInUser.name} (${formatCurrentWibTimestamp()})`
+        )
+      );
+    }
+
     const matrixPj = resolvePjShiftEntryFromMatrix(
       nurseSchedules,
       masterNurses,
@@ -2091,6 +2193,7 @@ export default function App() {
         onDateChange={handleActiveDateChange}
         isCustomDate={isDateCustomFromToday}
         onResetDateToToday={handleResetDateToToday}
+        onShiftChange={handleLogbookShiftChange}
         onLogout={handleLogout}
         isCloudConnected={isCloudConnected}
         isQuotaExceeded={isQuotaExceeded}
@@ -2156,6 +2259,7 @@ export default function App() {
             doctorSchedules={doctorSchedules}
             loggedInUser={loggedInUser}
             userRole={userRole}
+            onUpdateNurseSchedules={handleUpdateNurseSchedules}
             onShiftChange={handleLogbookShiftChange}
             onDateChange={handleActiveDateChange}
             isCustomDate={isDateCustomFromToday}
@@ -2228,9 +2332,9 @@ export default function App() {
         {currentTab === 'jadwal_dinas' && accessibleTabs.includes('jadwal_dinas') && (
           <JadwalDinasView
             nurseSchedules={nurseSchedules}
-            setNurseSchedules={setNurseSchedules}
+            setNurseSchedules={handleUpdateNurseSchedules}
             doctorSchedules={doctorSchedules}
-            setDoctorSchedules={setDoctorSchedules}
+            setDoctorSchedules={handleUpdateDoctorSchedules}
             masterNurses={masterNurses}
             masterDoctors={masterDoctors}
             shiftInfo={shiftInfo}

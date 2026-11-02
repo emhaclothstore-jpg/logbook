@@ -739,7 +739,11 @@ export function subscribeToNurseSchedules(onUpdate: (schedules: NurseScheduleEnt
           }
           lastWrittenDocHashes.set(docKey, contentHash);
           onUpdate(d.schedules as NurseScheduleEntry[]);
+        } else {
+          onUpdate([]);
         }
+      } else {
+        onUpdate([]);
       }
     },
     (err) => {
@@ -810,7 +814,11 @@ export function subscribeToDoctorSchedules(onUpdate: (schedules: DoctorScheduleE
           }
           lastWrittenDocHashes.set(docKey, contentHash);
           onUpdate(d.schedules as DoctorScheduleEntry[]);
+        } else {
+          onUpdate([]);
         }
+      } else {
+        onUpdate([]);
       }
     },
     (err) => {

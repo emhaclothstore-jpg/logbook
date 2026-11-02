@@ -41,6 +41,7 @@ interface AppNavigationShellProps {
   onDateChange?: (isoDate: string) => void;
   isCustomDate?: boolean;
   onResetDateToToday?: () => void;
+  onShiftChange?: (shift: 'Pagi' | 'Siang') => void;
   onLogout?: () => void;
   isCloudConnected?: boolean;
   isQuotaExceeded?: boolean;

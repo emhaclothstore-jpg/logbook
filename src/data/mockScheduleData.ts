@@ -343,46 +343,23 @@ export function generateBenchmarkDoctorSchedules(dateIso: string): DoctorSchedul
   ];
 }
 
-const todayIso = getCurrentIsoDateWib();
-const activeYearMonth = parseYearMonthFromIso(todayIso);
-
-function buildInitialMonthlyNurseSchedules(): NurseScheduleEntry[] {
-  const monthly = generateMonthlyNurseRoster(
-    activeYearMonth.year,
-    activeYearMonth.month,
-    sampleBenchmarkNurses
-  );
-  const todayBenchmark = generateBenchmarkNurseSchedules(todayIso);
-  const otherDays = monthly.filter((s) => s.date !== todayIso);
-  return [...otherDays, ...todayBenchmark];
-}
-
-export const initialNurseSchedules: NurseScheduleEntry[] = buildInitialMonthlyNurseSchedules();
-
-function buildInitialMonthlyDoctorSchedules(): DoctorScheduleEntry[] {
-  const monthly = generateMonthlyDoctorRoster(
-    activeYearMonth.year,
-    activeYearMonth.month,
-    initialMasterDoctors
-  );
-  const todayBenchmark = generateBenchmarkDoctorSchedules(todayIso);
-  const otherDays = monthly.filter((s) => s.date !== todayIso);
-  return [...otherDays, ...todayBenchmark];
-}
-
-// Matriks Jadwal Dokter terisi lengkap secara resmi (PERNEFRI & RS Happy Land) untuk seluruh bulan
-export const initialDoctorSchedules: DoctorScheduleEntry[] = buildInitialMonthlyDoctorSchedules();
+/**
+ * Jadwal shift awal bawaan sistem dibuat bersih / kosong (empty array []).
+ * Sistem tidak lagi mengisi jadwal tiruan otomatis yang berubah-ubah saat tanggal berganti.
+ * Seluruh jadwal diinput riil oleh Perawat/Dokter/Admin atau diisi via fitur template bila diperlukan.
+ */
+export const initialNurseSchedules: NurseScheduleEntry[] = [];
+export const initialDoctorSchedules: DoctorScheduleEntry[] = [];
 
 /**
- * Returns existing doctor schedules without forcing synthetic benchmarks,
- * falling back to official benchmark monthly roster when empty.
+ * Returns existing doctor schedules safely without forcing synthetic benchmarks.
  */
 export function ensureAllOfficialDoctorSchedules(
   existingSchedules: DoctorScheduleEntry[],
   _dateIso?: string
 ): DoctorScheduleEntry[] {
-  if (!Array.isArray(existingSchedules) || existingSchedules.length === 0) {
-    return initialDoctorSchedules;
+  if (!Array.isArray(existingSchedules)) {
+    return [];
   }
   return existingSchedules;
 }

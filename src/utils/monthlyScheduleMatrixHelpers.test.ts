@@ -12,7 +12,9 @@ import {
   resolvePjShiftEntryFromMatrix,
   resolveScheduledDoctorsFromMatrix,
   mergeNurseSchedules,
-  mergeDoctorSchedules
+  mergeDoctorSchedules,
+  isLegacySyntheticScheduleEntry,
+  stripLegacySyntheticSchedules
 } from './monthlyScheduleMatrixHelpers.ts';
 import { sampleBenchmarkNurses, initialMasterDoctors } from '../data/mockMasterData.ts';
 
@@ -214,6 +216,37 @@ test('mergeNurseSchedules and mergeDoctorSchedules preserve local data and avoid
   const conflictResolved = mergeDoctorSchedules(newerLocalDoc, olderRemoteDoc);
   assert.equal(conflictResolved.length, 1);
   assert.equal(conflictResolved[0].shift, 'Siang');
+});
+
+test('isLegacySyntheticScheduleEntry and stripLegacySyntheticSchedules purge dummy schedules without dropping user entries', () => {
+  const dummyNurseEntry = {
+    id: 'nsch-2026-11-02-01',
+    nurseName: 'TWIS FERTILIANTI PW',
+    date: '2026-11-02',
+    notes: 'Supervisi Klinis & Manajerial Unit HD'
+  };
+  const dummyDoctorEntry = {
+    id: 'dsch-2026-11-02-01',
+    doctorName: 'dr. Heru Prasanto',
+    date: '2026-11-02',
+    notes: 'DPJP Utama Shift Pagi (Visite & Preskripsi)'
+  };
+  const realCustomEntry = {
+    id: 'custom-sch-01',
+    nurseName: 'M HAIKAL MALILANG',
+    date: '2026-11-02',
+    notes: 'Jadwal riil dinas shift pagi unit HD'
+  };
+
+  assert.equal(isLegacySyntheticScheduleEntry(dummyNurseEntry), true);
+  assert.equal(isLegacySyntheticScheduleEntry(dummyDoctorEntry), true);
+  assert.equal(isLegacySyntheticScheduleEntry(realCustomEntry), false);
+
+  const mixed = [dummyNurseEntry, realCustomEntry, dummyDoctorEntry];
+  const cleaned = stripLegacySyntheticSchedules(mixed);
+  assert.equal(cleaned.length, 1);
+  assert.equal(cleaned[0].id, 'custom-sch-01');
+  assert.equal((cleaned[0] as { nurseName?: string }).nurseName, 'M HAIKAL MALILANG');
 });
 
 

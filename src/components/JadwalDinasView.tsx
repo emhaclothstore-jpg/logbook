@@ -42,7 +42,8 @@ import {
   copyPreviousMonthDoctorRoster,
   computeNurseMonthlyStat,
   computeDoctorMonthlyStat,
-  exportMonthlyScheduleMatrixXlsx
+  exportMonthlyScheduleMatrixXlsx,
+  stripLegacySyntheticSchedules
 } from '../utils/monthlyScheduleMatrixHelpers.ts';
 import { printDocumentWithOrientation, downloadElementAsPdf } from '../utils/printHelpers.ts';
 import { RshlLogo } from './RshlLogo.tsx';
@@ -100,8 +101,8 @@ interface CellDetailModalState {
 }
 
 interface PendingBatchConfirm {
-  action: 'fill_standard' | 'copy_prev' | 'clear_month';
-  target: 'perawat' | 'dokter';
+  action: 'fill_standard' | 'copy_prev' | 'clear_month' | 'purge_default';
+  target: 'perawat' | 'dokter' | 'all';
   title: string;
   description: string;
 }
@@ -507,14 +508,33 @@ export const JadwalDinasView: React.FC<JadwalDinasViewProps> = ({
         title: `Kosongkan Matriks ${targetLabel} Bulan ${monthName} ${selectedYear}?`,
         description: `Seluruh isian jadwal ${targetLabel.toLowerCase()} pada bulan ${monthName} ${selectedYear} akan dikosongkan (bulan lain tetap aman).`
       });
+    } else if (action === 'purge_default') {
+      setPendingConfirm({
+        action: 'purge_default',
+        target: 'all',
+        title: 'Hapus Semua Jadwal Shift Bawaan Sistem?',
+        description:
+          'Seluruh jadwal tiruan bawaan sistem (dummy/benchmark) untuk perawat dan dokter akan dibersihkan secara permanen dari sistem dan cloud. Jadwal yang Anda input sendiri tidak akan terhapus.'
+      });
     }
   };
 
   const executeBatchAction = (
     action: PendingBatchConfirm['action'],
-    target: 'perawat' | 'dokter'
+    target: 'perawat' | 'dokter' | 'all'
   ) => {
     setPendingConfirm(null);
+
+    if (action === 'purge_default') {
+      const cleanNurses = stripLegacySyntheticSchedules(nurseSchedules);
+      const cleanDoctors = stripLegacySyntheticSchedules(doctorSchedules);
+      setNurseSchedules(cleanNurses);
+      setDoctorSchedules(cleanDoctors);
+      showFeedback(
+        'Jadwal shift bawaan sistem berhasil dihapus bersih. Matriks jadwal perawat dan dokter kini steril dan siap diisi data riil.'
+      );
+      return;
+    }
 
     if (action === 'fill_standard') {
       if (target === 'perawat') {
@@ -905,7 +925,7 @@ export const JadwalDinasView: React.FC<JadwalDinasViewProps> = ({
                   executeBatchAction(pendingConfirm.action, pendingConfirm.target)
                 }
                 className={`px-3.5 py-1.5 text-white rounded-lg text-xs font-bold cursor-pointer whitespace-nowrap shrink-0 shadow-2xs ${
-                  pendingConfirm.action === 'clear_month'
+                  pendingConfirm.action === 'clear_month' || pendingConfirm.action === 'purge_default'
                     ? 'bg-rose-600 hover:bg-rose-700'
                     : 'bg-blue-700 hover:bg-blue-800'
                 }`}
@@ -1193,6 +1213,16 @@ export const JadwalDinasView: React.FC<JadwalDinasViewProps> = ({
                       <Trash2 className="w-3.5 h-3.5 text-rose-500 shrink-0" />
                       <span>Kosongkan Bulan</span>
                     </button>
+
+                    <button
+                      type="button"
+                      onClick={() => requestBatchAction('purge_default')}
+                      className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 shadow-2xs"
+                      title="Hapus seluruh jadwal tiruan bawaan sistem (dummy/benchmark) agar matriks bersih"
+                    >
+                      <Trash2 className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                      <span>Hapus Jadwal Bawaan</span>
+                    </button>
                   </div>
                 )}
               </div>
@@ -1291,6 +1321,20 @@ export const JadwalDinasView: React.FC<JadwalDinasViewProps> = ({
                 </div>
               )}
             </div>
+
+            {/* Empty month notification */}
+            {((matrixTab === 'perawat' && monthNurseSchedules.length === 0) ||
+              (matrixTab === 'dokter' && monthDoctorSchedules.length === 0)) && (
+              <div className="mx-4 mt-3 mb-2 p-3 bg-sky-50/70 border border-sky-200/80 rounded-xl flex items-center justify-between gap-3 text-xs text-sky-900">
+                <div className="flex items-center gap-2">
+                  <Info className="w-4 h-4 text-sky-600 shrink-0" />
+                  <span>
+                    Matriks jadwal {matrixTab === 'perawat' ? 'perawat' : 'dokter'} bulan {monthName} {selectedYear} bersih (tidak ada jadwal tiruan bawaan).
+                    Gunakan Kuas Shift untuk menandai jadwal riil, impor Excel, atau klik &quot;Isi Pola Standar&quot; jika ingin menerapkan draf rotasi PERNEFRI.
+                  </span>
+                </div>
+              </div>
+            )}
 
             {/* =============================================================== */}
             {/* 5A. MATRIKS PERAWAT TABLE                                       */}
